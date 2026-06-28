@@ -1,9 +1,9 @@
-constexpr int TFT_SCLK_PIN = 7;
-constexpr int TFT_MOSI_PIN = 6;
+constexpr int TFT_SCLK_PIN = 10;
+constexpr int TFT_MOSI_PIN = 14;
 constexpr int TFT_CS_PIN = 5;
 constexpr int TFT_DC_PIN = 4;
 constexpr int TFT_RST_PIN = 8;
-constexpr int TFT_BL_PIN = 15;
+constexpr int TFT_BL_PIN = 40;
 
 constexpr int JOYSTICK_X_PIN = 13;
 constexpr int JOYSTICK_Y_PIN = 12;
@@ -21,10 +21,9 @@ constexpr int SD_SCLK_PIN = 10;
 constexpr int SD_MOSI_PIN = 14;
 constexpr int SD_CS_PIN = 38;
 
-constexpr int CC1101_SPI_MOSI_PIN = 14;
-constexpr int CC1101_SPI_MISO_PIN = 9;
-constexpr int CC1101_SPI_SCLK_PIN = 10;
-
+constexpr int CC1101_SPI_MOSI_PIN = 1;
+constexpr int CC1101_SPI_MISO_PIN = 2;
+constexpr int CC1101_SPI_SCLK_PIN = 42;
 constexpr int CC1101_CS_PIN = 16;
 constexpr int CC1101_GDO0_PIN = 17;
 constexpr int CC1101_GDO2_PIN = 47;
