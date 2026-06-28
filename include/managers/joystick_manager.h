@@ -21,6 +21,8 @@ typedef struct {
   bool deep_sleep_triggered;
   bool analog;
   bool analog_active_high;
+  bool analog_state_pressed;
+  int analog_state_index;
   int adc_unit;
   int adc_channel;
 } joystick_t;

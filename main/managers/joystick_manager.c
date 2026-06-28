@@ -3,21 +3,71 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
+#include <stdlib.h>
 #include "sdkconfig.h"
 #include "esp_log.h"
 
 #ifdef CONFIG_USE_ANALOG_JOYSTICK
 #include "esp_adc/adc_oneshot.h"
-#endif
 
-#ifdef CONFIG_USE_IO_EXPANDER
-static const char *TAG = "JOYSTICK_IO";
-static bool io_expander_initialized = false;
-#endif
+#define ANALOG_JOYSTICK_STATE_MAX 8
+#define ANALOG_JOYSTICK_SAMPLE_CACHE_US 2000
+#define ANALOG_JOYSTICK_CENTER_SAMPLES 8
+#define ANALOG_JOYSTICK_CENTER_SETTLE_MS 2
 
-#ifdef CONFIG_USE_ANALOG_JOYSTICK
+typedef struct {
+    bool in_use;
+    int unit;
+    int channel;
+    bool calibrated;
+    int center;
+    int filtered_raw;
+    int last_raw;
+    int64_t last_raw_us;
+    bool has_last_raw;
+} analog_axis_state_t;
+
 static const char *TAG_ANALOG = "JOYSTICK_ADC";
 static adc_oneshot_unit_handle_t adc_handles[2] = {NULL, NULL};
+static analog_axis_state_t s_analog_states[ANALOG_JOYSTICK_STATE_MAX];
+
+static int analog_clamp_int(int value, int min_value, int max_value) {
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static analog_axis_state_t *joystick_adc_get_state(int unit, int channel) {
+    if ((unit != ADC_UNIT_1 && unit != ADC_UNIT_2) || channel < 0) {
+        return NULL;
+    }
+
+    for (int i = 0; i < ANALOG_JOYSTICK_STATE_MAX; i++) {
+        if (s_analog_states[i].in_use &&
+            s_analog_states[i].unit == unit &&
+            s_analog_states[i].channel == channel) {
+            return &s_analog_states[i];
+        }
+    }
+
+    for (int i = 0; i < ANALOG_JOYSTICK_STATE_MAX; i++) {
+        if (!s_analog_states[i].in_use) {
+            memset(&s_analog_states[i], 0, sizeof(s_analog_states[i]));
+            s_analog_states[i].in_use = true;
+            s_analog_states[i].unit = unit;
+            s_analog_states[i].channel = channel;
+            s_analog_states[i].center = CONFIG_ANALOG_JOYSTICK_CENTER;
+            s_analog_states[i].filtered_raw = CONFIG_ANALOG_JOYSTICK_CENTER;
+            return &s_analog_states[i];
+        }
+    }
+
+    return NULL;
+}
 
 static esp_err_t joystick_adc_get_handle(int unit, adc_oneshot_unit_handle_t *handle_out) {
     if (!handle_out) {
@@ -66,6 +116,77 @@ static bool joystick_adc_read(const joystick_t *joystick, int *raw_out) {
 
     return adc_oneshot_read(handle, joystick->adc_channel, raw_out) == ESP_OK;
 }
+
+static bool joystick_adc_read_cached(const joystick_t *joystick, int *raw_out) {
+    if (!joystick || !raw_out) {
+        return false;
+    }
+
+    if (joystick->adc_unit < 0 || joystick->adc_channel < 0) {
+        return false;
+    }
+
+    analog_axis_state_t *state = joystick_adc_get_state(joystick->adc_unit, joystick->adc_channel);
+    int64_t now_us = esp_timer_get_time();
+    if (state && state->has_last_raw && (now_us - state->last_raw_us) <= ANALOG_JOYSTICK_SAMPLE_CACHE_US) {
+        *raw_out = state->last_raw;
+        return true;
+    }
+
+    if (!joystick_adc_read(joystick, raw_out)) {
+        return false;
+    }
+
+    if (state) {
+        state->last_raw = *raw_out;
+        state->last_raw_us = now_us;
+        state->has_last_raw = true;
+    }
+
+    return true;
+}
+
+static int joystick_adc_calibrate_center(const joystick_t *joystick) {
+    int sum = 0;
+    int count = 0;
+
+    for (int i = 0; i < ANALOG_JOYSTICK_CENTER_SAMPLES; i++) {
+        int sample = 0;
+        if (joystick_adc_read(joystick, &sample)) {
+            sum += sample;
+            count++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(ANALOG_JOYSTICK_CENTER_SETTLE_MS));
+    }
+
+    if (count <= 0) {
+        return CONFIG_ANALOG_JOYSTICK_CENTER;
+    }
+
+    return analog_clamp_int(sum / count, 0, 4095);
+}
+
+static void joystick_adc_seed_state(const joystick_t *joystick, analog_axis_state_t *state) {
+    if (!joystick || !state || state->calibrated) {
+        return;
+    }
+
+    int center = joystick_adc_calibrate_center(joystick);
+    state->center = center;
+    state->filtered_raw = center;
+    state->last_raw = center;
+    state->has_last_raw = false;
+    state->last_raw_us = 0;
+    state->calibrated = true;
+
+    ESP_LOGI(TAG_ANALOG, "GPIO %d analog center calibrated to %d (deadzone=%d)",
+             joystick->pin, center, CONFIG_ANALOG_JOYSTICK_DEADZONE);
+}
+#endif
+
+#ifdef CONFIG_USE_IO_EXPANDER
+static const char *TAG = "JOYSTICK_IO";
+static bool io_expander_initialized = false;
 #endif
 
 void joystick_init(joystick_t *joystick, int pin, uint32_t hold_lim,
@@ -80,6 +201,8 @@ void joystick_init(joystick_t *joystick, int pin, uint32_t hold_lim,
   joystick->deep_sleep_triggered = false;
   joystick->analog = false;
   joystick->analog_active_high = false;
+  joystick->analog_state_pressed = false;
+  joystick->analog_state_index = -1;
   joystick->adc_unit = -1;
   joystick->adc_channel = -1;
 
@@ -115,6 +238,8 @@ void joystick_init_analog(joystick_t *joystick, int pin, bool active_high,
   joystick->deep_sleep_triggered = false;
   joystick->analog = true;
   joystick->analog_active_high = active_high;
+  joystick->analog_state_pressed = false;
+  joystick->analog_state_index = -1;
   joystick->adc_unit = -1;
   joystick->adc_channel = -1;
 
@@ -154,6 +279,15 @@ void joystick_init_analog(joystick_t *joystick, int pin, bool active_high,
     ESP_LOGE(TAG_ANALOG, "Failed to configure ADC channel for GPIO %d: %s", pin, esp_err_to_name(ret));
     joystick->adc_unit = -1;
     joystick->adc_channel = -1;
+    return;
+  }
+
+  analog_axis_state_t *state = joystick_adc_get_state(joystick->adc_unit, joystick->adc_channel);
+  if (state) {
+    joystick->analog_state_index = (int)(state - s_analog_states);
+    joystick_adc_seed_state(joystick, state);
+  } else {
+    ESP_LOGW(TAG_ANALOG, "No free analog state slots available for GPIO %d", pin);
   }
 #else
   (void)active_high;
@@ -208,15 +342,76 @@ bool joystick_get_button_state(joystick_t *joystick) {
 #ifdef CONFIG_USE_ANALOG_JOYSTICK
   if (joystick->analog) {
     int raw = 0;
-    if (!joystick_adc_read(joystick, &raw)) {
+    if (!joystick_adc_read_cached(joystick, &raw)) {
       return false;
     }
 
-    const int center = CONFIG_ANALOG_JOYSTICK_CENTER;
-    const int deadzone = CONFIG_ANALOG_JOYSTICK_DEADZONE;
-    const int low_edge = center - deadzone;
-    const int high_edge = center + deadzone;
-    return joystick->analog_active_high ? (raw >= high_edge) : (raw <= low_edge);
+    analog_axis_state_t *state = NULL;
+    if (joystick->analog_state_index >= 0 && joystick->analog_state_index < ANALOG_JOYSTICK_STATE_MAX &&
+        s_analog_states[joystick->analog_state_index].in_use) {
+      state = &s_analog_states[joystick->analog_state_index];
+    } else {
+      state = joystick_adc_get_state(joystick->adc_unit, joystick->adc_channel);
+    }
+
+    const int fallback_center = CONFIG_ANALOG_JOYSTICK_CENTER;
+    int center = fallback_center;
+    int filtered = raw;
+    bool use_state = (state != NULL && state->calibrated);
+
+    if (use_state) {
+      if (state->filtered_raw == 0) {
+        state->filtered_raw = raw;
+      } else {
+        state->filtered_raw = (state->filtered_raw * 3 + raw) / 4;
+      }
+      filtered = state->filtered_raw;
+      center = state->center;
+    }
+
+    int deadzone = analog_clamp_int(CONFIG_ANALOG_JOYSTICK_DEADZONE, 1, 2047);
+    int hysteresis = deadzone / 4;
+    if (hysteresis < 16) {
+      hysteresis = 16;
+    }
+    if (hysteresis >= deadzone) {
+      hysteresis = deadzone - 1;
+    }
+    int press_threshold = deadzone;
+    int release_threshold = deadzone - hysteresis;
+    if (release_threshold < 8) {
+      release_threshold = 8;
+    }
+
+    int delta = filtered - center;
+    int center_blend_window = release_threshold / 2;
+    if (center_blend_window < 8) {
+      center_blend_window = 8;
+    }
+
+    if (use_state && !joystick->analog_state_pressed && abs(delta) <= center_blend_window) {
+      state->center = (state->center * 31 + filtered) / 32;
+      center = state->center;
+      delta = filtered - center;
+    }
+
+    bool pressed;
+    if (joystick->analog_active_high) {
+      if (joystick->analog_state_pressed) {
+        pressed = delta >= release_threshold;
+      } else {
+        pressed = delta >= press_threshold;
+      }
+    } else {
+      if (joystick->analog_state_pressed) {
+        pressed = delta <= -release_threshold;
+      } else {
+        pressed = delta <= -press_threshold;
+      }
+    }
+
+    joystick->analog_state_pressed = pressed;
+    return pressed;
   }
 #endif
 
@@ -288,4 +483,3 @@ bool joystick_just_released(joystick_t *joystick) {
     return false;
   }
 }
-
