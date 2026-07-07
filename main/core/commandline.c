@@ -8394,8 +8394,9 @@ static void badusb_strip_quotes(char *text) {
 void handle_badusb_cmd(int argc, char **argv) {
 #ifdef CONFIG_HAS_BADUSB
     if (argc < 2) {
-        glog("Usage: badusb <run|list|stop|exec|set_vid|set_pid|set_mfr|set_prod|set_rand|set_layout>\n");
+        glog("Usage: badusb <run|clicker|list|stop|exec|set_vid|set_pid|set_mfr|set_prod|set_rand|set_layout>\n");
         glog("  badusb run <filename>  - Execute a DuckyScript from /mnt/ghostesp/badusb/\n");
+        glog("  badusb clicker         - Run the super clicker mouse HID loop\n");
         glog("  badusb list            - List available scripts\n");
         glog("  badusb stop            - Stop current execution\n");
         glog("  badusb exec <size>     - Prepare to receive a script via stream\n");
@@ -8443,6 +8444,11 @@ void handle_badusb_cmd(int argc, char **argv) {
             if (ret != ESP_OK) {
                 glog("BadUSB: Failed to execute %s\n", argv[2]);
             }
+        }
+    } else if (strcmp(sub, "clicker") == 0) {
+        esp_err_t ret = badusb_manager_start_clicker();
+        if (ret != ESP_OK) {
+            glog("BadUSB: Failed to start super clicker\n");
         }
     } else if (strcmp(sub, "exec") == 0) {
         if (argc < 3) {
