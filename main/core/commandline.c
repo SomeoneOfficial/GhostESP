@@ -8,6 +8,8 @@
 #include "esp_sntp.h"
 #include "esp_mac.h"
 #include "managers/ap_manager.h"
+#include "managers/badusb_builtin_script.h"
+#include "managers/badusb_manager.h"
 #include "managers/ota_manager.h"
 #include "sdkconfig.h"
 #include "vendor/drivers/pcf8563.h"
@@ -25,6 +27,12 @@
 #include "managers/views/error_popup.h"
 #include "managers/settings_sd_backup.h"
 #include "managers/wifi_manager.h"
+#include "managers/chameleon_manager.h"
+#include "managers/subghz_remote_manager.h"
+#include "managers/usb_keyboard_manager.h"
+#include "managers/views/subghz_view.h"
+#include "scans/wifi/port_scan.h"
+#include "scans/wifi/ssh_scan.h"
 #include "scans/wifi/wifi_channels.h"
 #include "scans/wifi/wpa3_compliance.h"
 #include "managers/sd_card_manager.h"
@@ -130,9 +138,62 @@ extern dns_server_handle_t dns_handle;
 #include "managers/views/app_gallery_screen.h"
 #include "managers/plugin_manager.h"
 #include "managers/plugin_loader.h"
+#include "esp_tls.h"
+#include "esp_crt_bundle.h"
+#include "esp_core_dump.h"
 #ifdef CONFIG_WITH_SCREEN
 #include "managers/views/plugin_runner_view.h"
 #endif
+
+#ifndef MAX_WIFI_CHANNEL
+#if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
+#define MAX_WIFI_CHANNEL 165
+#else
+#define MAX_WIFI_CHANNEL 13
+#endif
+#endif
+
+#ifndef MAX_PORTAL_PATH_LEN
+#define MAX_PORTAL_PATH_LEN 128
+#endif
+
+#ifndef DISCOVER_TASK_STACK
+#if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
+#define DISCOVER_TASK_STACK 4096
+#else
+#define DISCOVER_TASK_STACK 6144
+#endif
+#endif
+
+static const char *TAG = "commandline";
+
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
+
+typedef struct {
+    int last_percent;
+    int last_total;
+} chameleon_cli_progress_state_t;
+
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
+
+static void chameleon_cli_progress_cb(int current, int total, void *user) {
+    chameleon_cli_progress_state_t *state = (chameleon_cli_progress_state_t *)user;
+    if (!state || total <= 0) return;
+    if (current < 0) current = 0;
+    if (current > total) current = total;
+    if (total != state->last_total) state->last_percent = -1;
+    int percent = (int)((current * 100) / total);
+    if (percent != state->last_percent) {
+        glog("Classic dictionary progress: %d%% (%d/%d)\n", percent, current, total);
+        state->last_percent = percent;
+        state->last_total = total;
+    }
+}
 
 
 #include "attacks/wifi/dhcp_starvation.h"
@@ -232,27 +293,6 @@ CommandFunction find_command(const char *name) {
     }
     return NULL;
 }
-
-
-
-
-
-
-    // Reset WiFi to a good state
-    esp_err_t stop_err = esp_wifi_stop();
-    esp_err_t start_err = esp_wifi_start();
-
-    if (stop_err != ESP_OK || start_err != ESP_OK) {
-        glog("WiFi scan stop completed with recovery errors (stop=%s, start=%s).\n",
-             esp_err_to_name(stop_err), esp_err_to_name(start_err));
-        status_display_show_status("Scan Stop Warn");
-        return;
-    }
-
-    glog("WiFi scan stopped.\n");
-    status_display_show_status("Scan Stopped");
-}
-
 // settings registry to avoid ridiculously long strcmp chains, fuck that lmaooo.
 typedef enum {
     ST_I32,
@@ -3880,126 +3920,6 @@ void handle_crash(int argc, char **argv) {
     int *ptr = NULL;
     *ptr = 42;
 }
-
-#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
-/* Read coredump partition and print summary or stream base64 for host decode. */
-static void handle_coredump_cmd(int argc, char **argv) {
-    const esp_partition_t *part = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA,
-        ESP_PARTITION_SUBTYPE_DATA_COREDUMP,
-        NULL);
-    if (part == NULL) {
-        glog("No coredump partition found. Check partition table.\n");
-        return;
-    }
-
-    if (argc > 1 && strcmp(argv[1], "erase") == 0) {
-        /* Use partition erase on all targets (esp_core_dump_image_erase can fail on plain ESP32). */
-        size_t esz = part->erase_size;
-        size_t to_erase = (part->size / esz) * esz;
-        if (to_erase == 0) {
-            to_erase = esz;
-        }
-        esp_err_t err = esp_partition_erase_range(part, 0, to_erase);
-        if (err == ESP_OK) {
-            glog("Coredump partition erased.\n");
-        } else {
-            glog("Failed to erase coredump: %s\n", esp_err_to_name(err));
-        }
-        return;
-    }
-
-    const int do_dump = (argc > 1 && strcmp(argv[1], "dump") == 0);
-
-    if (do_dump) {
-        /* Stream partition as base64 so user can save and run: idf.py coredump-info -c <file> */
-        glog("=== COREDUMP BASE64 START ===\n");
-        glog("Save the lines below to a file (e.g. coredump.b64), then run:\n");
-        glog("  idf.py coredump-info -c coredump.b64\n");
-        glog("(Omit the start/end marker lines from the file.)\n");
-        uint8_t buf[768]; /* multiple of 3 for base64 */
-        char b64[1032];
-        size_t offset = 0;
-        while (offset < part->size) {
-            size_t chunk = (part->size - offset) > sizeof(buf) ? sizeof(buf) : (part->size - offset);
-            if (esp_partition_read(part, offset, buf, chunk) != ESP_OK) {
-                glog("\nRead error at offset %u\n", (unsigned)offset);
-                break;
-            }
-            size_t written = 0;
-            int ret = mbedtls_base64_encode((unsigned char *)b64, sizeof(b64), &written, buf, chunk);
-            if (ret != 0) {
-                glog("\nBase64 encode error\n");
-                break;
-            }
-            b64[written] = '\0';
-            glog("%s", b64);
-            offset += chunk;
-        }
-        glog("\n=== COREDUMP BASE64 END ===\n");
-        return;
-    }
-
-    /* Summary: partition info and whether it contains valid coredump data.
-     * ESP-IDF may write a small header (e.g. checksum) before the ELF, so scan
-     * the first 128 bytes for ELF magic (0x7f 'E' 'L' 'F') instead of only offset 0. */
-    uint8_t head[128];
-    size_t head_len = part->size < sizeof(head) ? (size_t)part->size : sizeof(head);
-    if (esp_partition_read(part, 0, head, head_len) != ESP_OK) {
-        glog("Failed to read coredump partition.\n");
-        return;
-    }
-    int elf_offset = -1;
-    for (size_t i = 0; i + 4 <= head_len; i++) {
-        if (head[i] == 0x7f && head[i + 1] == 'E' && head[i + 2] == 'L' && head[i + 3] == 'F') {
-            elf_offset = (int)i;
-            break;
-        }
-    }
-    const int is_elf = (elf_offset >= 0);
-
-    glog("Coredump partition: %s, size %u bytes\n", part->label, (unsigned)part->size);
-
-    /* Use ESP-IDF API to parse and print panic reason from coredump in flash */
-    {
-        char panic_reason[256];
-        esp_err_t err = esp_core_dump_get_panic_reason(panic_reason, sizeof(panic_reason));
-        if (err == ESP_OK && panic_reason[0] != '\0') {
-            glog("Panic reason: %s\n", panic_reason);
-        } else if (err == ESP_ERR_NOT_FOUND) {
-            /* Do not call esp_core_dump_get_summary() here: it uses too much stack and can
-             * cause Stack protection fault in SerialTask (same task as CLI). */
-            glog("Panic reason: (not available on device; run idf.py coredump-info on host)\n");
-        } else {
-            glog("Panic reason: (error %s)\n", esp_err_to_name(err));
-        }
-    }
-
-    if (is_elf) {
-        glog("Coredump data: present (ELF format");
-        if (elf_offset > 0) {
-            glog(", ELF at offset %d", elf_offset);
-        }
-        glog(").\n");
-        glog("For full backtrace run on host: idf.py coredump-info\n");
-    } else {
-        /* Check for empty (all 0xff) or binary format */
-        int empty = 1;
-        for (size_t i = 0; i < head_len && empty; i++) {
-            if (head[i] != 0xff) {
-                empty = 0;
-            }
-        }
-        if (empty != 0) {
-            glog("Coredump data: partition empty (no crash recorded yet).\n");
-        } else {
-            glog("Coredump data: present (binary format).\n");
-            glog("For full backtrace run on host: idf.py coredump-info\n");
-        }
-    }
-}
-#endif /* CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH */
-
 
 // Help command
 void handle_help(int argc, char **argv) {

@@ -176,6 +176,15 @@ static bool badusb_send_key(uint8_t modifiers, uint8_t keycode, void *ctx) {
     return true;
 }
 
+static bool badusb_wait_for_mouse_ready(uint32_t timeout_ms) {
+    uint32_t waited_ms = 0;
+    while (!tud_hid_n_ready(HID_INSTANCE_MOUSE) && waited_ms < timeout_ms && !s_stop_requested) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        waited_ms++;
+    }
+    return tud_hid_n_ready(HID_INSTANCE_MOUSE) && !s_stop_requested;
+}
+
 static bool badusb_send_string(const char *text, size_t len, void *ctx) {
     (void)ctx;
     if (s_stop_requested) return false;
@@ -251,34 +260,23 @@ static esp_err_t badusb_wait_for_vbus(const char *status_after_connect) {
 
 bool badusb_hid_mouse_send(int8_t dx, int8_t dy, uint8_t buttons) {
     if (!s_active) return false;
-    int timeout = 100;
-    while (!tud_hid_n_ready(HID_INSTANCE_MOUSE) && timeout-- > 0) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    if (!tud_hid_n_ready(HID_INSTANCE_MOUSE)) return false;
+    if (!badusb_wait_for_mouse_ready(100)) return false;
 
-    // Descriptor is boot mouse: buttons, X, Y, wheel. Send exactly 4 bytes.
-    uint8_t report[4] = {buttons, (uint8_t)dx, (uint8_t)dy, 0};
-    return tud_hid_n_report(HID_INSTANCE_MOUSE, 0, report, sizeof(report));
+    return tud_hid_n_mouse_report(HID_INSTANCE_MOUSE, 0, buttons, dx, dy, 0, 0);
 }
 
 bool badusb_hid_mouse_wheel_send(int8_t wheel, uint8_t buttons) {
     if (!s_active) return false;
-    int timeout = 100;
-    while (!tud_hid_n_ready(HID_INSTANCE_MOUSE) && timeout-- > 0) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    if (!tud_hid_n_ready(HID_INSTANCE_MOUSE)) return false;
+    if (!badusb_wait_for_mouse_ready(100)) return false;
 
-    // Wheel-only report keeps dx/dy at zero so the cursor doesn't drift.
-    uint8_t report[4] = {buttons, 0, 0, (uint8_t)wheel};
-    return tud_hid_n_report(HID_INSTANCE_MOUSE, 0, report, sizeof(report));
+    return tud_hid_n_mouse_report(HID_INSTANCE_MOUSE, 0, buttons, 0, 0, wheel, 0);
 }
 
 // --- Mouse Jiggler ---
 
 static TaskHandle_t s_jiggler_task = NULL;
 static TaskHandle_t s_mode_start_task = NULL;
+static TaskHandle_t s_exec_task_handle = NULL;
 static volatile bool s_jiggler_stop = false;
 static volatile bool s_trackpad_active = false;
 static volatile uint8_t s_trackpad_buttons = 0;
@@ -699,12 +697,23 @@ esp_err_t badusb_manager_stop(void) {
     s_jiggler_stop = true;
     s_trackpad_active = false;
     s_trackpad_buttons = 0;
+
+    for (int i = 0; i < 100 && (s_mode_start_task || s_jiggler_task || s_exec_task_handle); i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (s_jiggler_task || s_mode_start_task || s_exec_task_handle) {
+        ESP_LOGW(TAG, "BadUSB stop timed out waiting for tasks to exit");
+    }
+
+    if (s_driver_installed) {
+        badusb_uninstall_driver();
+    }
+
     s_active = false;
     ESP_LOGI(TAG, "BadUSB stopped");
     return ESP_OK;
 }
-
-static TaskHandle_t s_exec_task_handle = NULL;
 
 typedef struct {
     bool clicker;
