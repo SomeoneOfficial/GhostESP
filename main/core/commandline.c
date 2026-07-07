@@ -2,25 +2,31 @@
 
 #include "core/commandline.h"
 #include "core/callbacks.h"
+#include "core/commands.h"
 #include "core/serial_manager.h"
 #include "core/utils.h"
 #include "esp_sntp.h"
 #include "esp_mac.h"
 #include "managers/ap_manager.h"
+#include "managers/ota_manager.h"
 #include "sdkconfig.h"
 #include "vendor/drivers/pcf8563.h"
 #ifndef CONFIG_IDF_TARGET_ESP32S2
 #include "managers/ble_manager.h"
+#include "managers/ble_bridge_manager.h"
 #include "attacks/ble/ble_spam.h"
+#include "scans/ble/advertiser_scan.h"
 #include "scans/ble/flipper_scan.h"
+#include "host/ble_gap.h"
 #endif
 #include "managers/dial_manager.h"
 #include "managers/rgb_manager.h"
 #include "managers/settings_manager.h"
+#include "managers/views/error_popup.h"
 #include "managers/settings_sd_backup.h"
 #include "managers/wifi_manager.h"
-#include "scans/wifi/port_scan.h"
-#include "scans/wifi/ssh_scan.h"
+#include "scans/wifi/wifi_channels.h"
+#include "scans/wifi/wpa3_compliance.h"
 #include "managers/sd_card_manager.h"
 #include "core/esp_comm_manager.h"
 #include "managers/status_display_manager.h"
@@ -37,9 +43,11 @@
 #if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
 #include "managers/zigbee_manager.h"
 #endif
-#ifdef CONFIG_HAS_BADUSB
-#include "managers/badusb_manager.h"
-#include "managers/badusb_builtin_script.h"
+#ifdef CONFIG_HAS_TLV320DAC_I2S
+#include "managers/audio_receiver_manager.h"
+#endif
+#ifdef CONFIG_HAS_AUDIO_PLAYER
+#include "managers/audio_stream_manager.h"
 #endif
 #ifdef CONFIG_WITH_ETHERNET
 #include "managers/ethernet_manager.h"
@@ -88,12 +96,8 @@ void* esp_netif_get_netif_impl(esp_netif_t *esp_netif);
 #include <unistd.h>
 #include <vendor/dial_client.h>
 #include "esp_wifi.h"
-#include "managers/default_portal.h"
 #include "core/glog.h"
 #include "core/dns_server.h"
-#include "esp_http_client.h"
-#include "esp_crt_bundle.h"
-#include "esp_tls.h"
 
 extern dns_server_handle_t dns_handle;
 #include <time.h>
@@ -101,13 +105,14 @@ extern dns_server_handle_t dns_handle;
 #include "esp_chip_info.h"
 #include "esp_idf_version.h"
 #include "core/ghostesp_version.h"
-#include "managers/chameleon_manager.h"
+#include "core/chip_info.h"
+#include "core/memory_debug.h"
 #include <stddef.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
-#include "esp_heap_trace.h"
 #include "esp_memory_utils.h"
 #include <dirent.h>
 #include "managers/infrared_manager.h"
@@ -115,126 +120,57 @@ extern dns_server_handle_t dns_handle;
 #include "core/screen_mirror.h"
 #include "managers/display_manager.h"
 #include "freertos/queue.h"
-#include "managers/usb_keyboard_manager.h"
 #include "mbedtls/base64.h"
 #include "esp_partition.h"
-#include "esp_core_dump.h"
 #include "managers/aerial_detector_manager.h"
 #include "managers/flock_detector_manager.h"
 #include "managers/wigle_manager.h"
 #include "managers/config_manager.h"
-#include "managers/nrf24_remote_manager.h"
-#include "managers/subghz_remote_manager.h"
 #include "managers/views/music_visualizer.h"
 #include "managers/views/app_gallery_screen.h"
+#include "managers/plugin_manager.h"
+#include "managers/plugin_loader.h"
+#ifdef CONFIG_WITH_SCREEN
+#include "managers/views/plugin_runner_view.h"
+#endif
 
-#if defined(CONFIG_WITH_SCREEN) && (defined(CONFIG_HAS_NRF24) || defined(CONFIG_HAS_NRF24_REMOTE))
-#include "managers/views/nrf24_analyzer_view.h"
-#endif
-#if defined(CONFIG_WITH_SCREEN) && (defined(CONFIG_HAS_SUBGHZ) || defined(CONFIG_HAS_SUBGHZ_REMOTE))
-#include "managers/views/subghz_view.h"
-#endif
 
 #include "attacks/wifi/dhcp_starvation.h"
-static const char *TAG = "Commandline";
-
-#if !defined(MAX_WIFI_CHANNEL)
-#if defined(CONFIG_IDF_TARGET_ESP32C5)
-#define MAX_WIFI_CHANNEL 165
-#else
-#define MAX_WIFI_CHANNEL 13
-#endif
-#endif
-
-#ifndef DISCOVER_TASK_STACK
-#if defined(CONFIG_USE_CARDPUTER) || defined(CONFIG_USE_CARDPUTER_ADV)
-#define DISCOVER_TASK_STACK 4096
-#else
-#define DISCOVER_TASK_STACK 6144
-#endif
-#endif
 
 static Command *command_list_head = NULL;
+static Command *command_pool = NULL;
+static Command *command_free_list = NULL;
+
+#define COMMAND_REGISTRY_MAX 192
 TaskHandle_t VisualizerHandle = NULL;
 TaskHandle_t gps_info_task_handle = NULL;
 
-// Static storage for GPS info task stack and TCB to enable proper cleanup
-static StackType_t* gps_task_stack = NULL;
-static StaticTask_t* gps_task_tcb = NULL;
+// Storage for GPS info task stack and TCB to enable proper cleanup
+StackType_t* gps_task_stack = NULL;
+StaticTask_t* gps_task_tcb = NULL;
 
-// Forward declarations for command handlers
-void cmd_wifi_scan_stop(int argc, char **argv);
-void handle_listportals(int argc, char **argv);
-void handle_evilportal(int argc, char **argv);
-void handle_wifi_disconnect(int argc, char **argv);
-void handle_wifi_status(int argc, char **argv);
-void handle_set_rgb_mode_cmd(int argc, char **argv);
-void handle_karma_cmd(int argc, char **argv);
-void handle_set_neopixel_brightness_cmd(int argc, char **argv);
-void handle_get_neopixel_brightness_cmd(int argc, char **argv);
-void handle_webuiap_cmd(int argc, char **argv);
-#ifndef CONFIG_IDF_TARGET_ESP32S2
-void handle_list_airtags_cmd(int argc, char **argv);
-void handle_select_airtag(int argc, char **argv);
-void handle_spoof_airtag(int argc, char **argv);
-void handle_stop_spoof(int argc, char **argv);
-void handle_ble_spam_cmd(int argc, char **argv);
+void command_init() {
+    free(command_pool);
+    command_pool = NULL;
+    command_list_head = NULL;
+    command_free_list = NULL;
+
+#if defined(CONFIG_SPIRAM)
+    command_pool = heap_caps_calloc(COMMAND_REGISTRY_MAX, sizeof(*command_pool), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #endif
-#ifdef CONFIG_WITH_STATUS_DISPLAY
-void handle_status_idle_cmd(int argc, char **argv);
-#endif
-void handle_settime_cmd(int argc, char **argv);
-void handle_time_cmd(int argc, char **argv);
-void handle_sinkhole_cmd(int argc, char **argv);
-void handle_aerial_scan_cmd(int argc, char **argv);
-void handle_aerial_list_cmd(int argc, char **argv);
-void handle_aerial_track_cmd(int argc, char **argv);
-void handle_aerial_stop_cmd(int argc, char **argv);
-void handle_aerial_spoof_cmd(int argc, char **argv);
-void handle_aerial_spoof_stop_cmd(int argc, char **argv);
-void handle_flock_scan_cmd(int argc, char **argv);
-void handle_flock_list_cmd(int argc, char **argv);
-void handle_flock_stop_cmd(int argc, char **argv);
-void handle_wigle_cmd(int argc, char **argv);
-void handle_loadconfig_cmd(int argc, char **argv);
-void handle_nrf24_cmd(int argc, char **argv);
-void handle_subghz_cmd(int argc, char **argv);
-#ifdef CONFIG_HAS_CAMERA
-void handle_motion_cmd(int argc, char **argv);
-void handle_camerastream_cmd(int argc, char **argv);
-#endif
+    if (!command_pool) {
+        command_pool = calloc(COMMAND_REGISTRY_MAX, sizeof(*command_pool));
+    }
+    if (!command_pool) {
+        glog("Failed to allocate command registry (%u entries)\n", (unsigned)COMMAND_REGISTRY_MAX);
+        return;
+    }
 
-#define MAX_PORTAL_PATH_LEN 128 // reasonable i guess?
-
-#ifdef __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
-#endif
-
-typedef struct {
-    int last_percent;
-    int last_total;
-} chameleon_cli_progress_state_t;
-
-#ifdef __GNUC__
-#pragma GCC diagnostic pop
-#endif
-
-static void chameleon_cli_progress_cb(int current, int total, void *user) {
-    chameleon_cli_progress_state_t *state = (chameleon_cli_progress_state_t *)user;
-    if (!state || total <= 0) return;
-    if (current < 0) current = 0;
-    if (current > total) current = total;
-    if (total != state->last_total) state->last_percent = -1;
-    int percent = (int)((current * 100) / total);
-    if (percent != state->last_percent) {
-        glog("Classic dictionary progress: %d%% (%d/%d)\n", percent, current, total);
-        state->last_percent = percent;
-        state->last_total = total;
+    for (int i = 0; i < COMMAND_REGISTRY_MAX; i++) {
+        command_pool[i].next = command_free_list;
+        command_free_list = &command_pool[i];
     }
 }
-
-void command_init() { command_list_head = NULL; }
 
 void register_command(const char *name, CommandFunction function) {
     // Check if the command already exists
@@ -247,19 +183,17 @@ void register_command(const char *name, CommandFunction function) {
         current = current->next;
     }
 
-    // Create a new command
-    Command *new_command = (Command *)malloc(sizeof(Command));
+    if (!command_pool) {
+        command_init();
+    }
+
+    Command *new_command = command_free_list;
     if (new_command == NULL) {
-        // Handle memory allocation failure
-        glog("Failed to register command '%s': out of memory\n", name);
+        glog("Failed to register command '%s': command registry full\n", name);
         return;
     }
-    new_command->name = strdup(name);
-    if (new_command->name == NULL) {
-        glog("Failed to register command '%s': out of memory\n", name);
-        free(new_command);
-        return;
-    }
+    command_free_list = new_command->next;
+    new_command->name = name;
     new_command->function = function;
     new_command->next = command_list_head;
     command_list_head = new_command;
@@ -277,8 +211,10 @@ void unregister_command(const char *name) {
             } else {
                 previous->next = current->next;
             }
-            free(current->name);
-            free(current);
+            current->name = NULL;
+            current->function = NULL;
+            current->next = command_free_list;
+            command_free_list = current;
             return;
         }
         previous = current;
@@ -289,7 +225,7 @@ void unregister_command(const char *name) {
 CommandFunction find_command(const char *name) {
     Command *current = command_list_head;
     while (current != NULL) {
-        if (strcmp(current->name, name) == 0) {
+        if (strcasecmp(current->name, name) == 0) {
             return current->function;
         }
         current = current->next;
@@ -297,54 +233,10 @@ CommandFunction find_command(const char *name) {
     return NULL;
 }
 
-void handle_unknown_command(const char *cmd) {
-    glog("Unsupported command: %s\n", cmd);
-}
 
-void cmd_wifi_scan_start(int argc, char **argv) {
-    esp_err_t timed_scan_err = ESP_OK;
-    if (argc > 1) {
-        if (strcmp(argv[1], "-stop") == 0) {
-            cmd_wifi_scan_stop(argc, argv);
-            return;
-        }
-        if (strcmp(argv[1], "-live") == 0) {
-            glog("Starting live AP scan...\n");
-            wifi_manager_start_live_ap_scan();
-            return;
-        }
-        char *endptr = NULL;
-        long seconds_long = strtol(argv[1], &endptr, 10);
-        if (endptr == argv[1] || *endptr != '\0') {
-            glog("Invalid scan duration '%s'. Use an integer number of seconds.\n", argv[1]);
-            return;
-        }
-        if (seconds_long < 1 || seconds_long > 120) {
-            glog("Scan duration out of range (%ld). Valid range is 1-120 seconds.\n", seconds_long);
-            return;
-        }
-        timed_scan_err = wifi_manager_start_scan_with_time((int)seconds_long);
-        if (timed_scan_err != ESP_OK) {
-            glog("WiFi timed scan failed: %s\n", esp_err_to_name(timed_scan_err));
-            status_display_show_status("Scan Failed");
-            return;
-        }
-    } else {
-        wifi_manager_start_scan();
-    }
-    wifi_manager_print_scan_results_with_oui();
-    status_display_show_status("Scan Complete");
-}
 
-void cmd_wifi_scan_stop(int argc, char **argv) {
-    // Properly stop any ongoing WiFi scan
-    wifi_manager_stop_scan();
 
-    // Stop monitor mode
-    wifi_manager_stop_monitor_mode();
 
-    // Close pcap file
-    pcap_file_close();
 
     // Reset WiFi to a good state
     esp_err_t stop_err = esp_wifi_stop();
@@ -10108,11 +10000,14 @@ void handle_sinkhole_cmd(int argc, char **argv) {
         glog("Unknown command. Use 'sinkhole help' for options.\n");
     }
 }
-
 void register_commands() {
     command_init();
     register_command("help", handle_help);
     register_command("mem", handle_mem_cmd);
+#if defined(CONFIG_NFC_ST25R3916) || defined(CONFIG_NFC_PN532)
+    register_command("nfc", handle_nfc_cmd);
+    register_command("nfctest", handle_nfctest_cmd);
+#endif
     register_command("scanap", cmd_wifi_scan_start);
     register_command("scansta", handle_sta_scan);
     register_command("scanlocal", handle_ip_lookup);
@@ -10141,11 +10036,16 @@ void register_commands() {
     register_command("stop", handle_stop_flipper);
     register_command("reboot", handle_reboot);
     register_command("startwd", handle_startwd);
+    register_command("wdstream", handle_wdstream_cmd);
     register_command("gpsinfo", handle_gps_info);
     register_command("gpspin", handle_gps_pin);
+    register_command("gpsbaud", handle_gps_baud);
     register_command("scanports", handle_scan_ports);
     register_command("scanarp", handle_scan_arp);
     register_command("scanssh", handle_scan_ssh);
+    register_command("netbiosscan", handle_netbios_scan);
+    register_command("httpbannerscan", handle_http_banner_scan);
+    register_command("snmpprobe", handle_snmp_probe);
     register_command("congestion", handle_congestion_cmd);
     register_command("listenprobes", handle_listen_probes_cmd);
     register_command("settings", handle_settings_cmd);
@@ -10157,9 +10057,18 @@ void register_commands() {
     register_command("commstatus", handle_comm_status);
     register_command("commdisconnect", handle_comm_disconnect);
     register_command("commsetpins", handle_comm_setpins);
+#if GHOSTESP_OTA_SUPPORTED
+    // Only registered on 8MB/16MB boards -- these handlers live in
+    // peer_ota_manager.c, so registering them unconditionally would pull
+    // that file's static buffers into every board's BSS for nothing.
+    register_command("otarecv", handle_otarecv_cmd);
+    register_command("otastatus", handle_otastatus_cmd);
+    register_command("otaabort", handle_otaabort_cmd);
+#endif
 
 #ifndef CONFIG_IDF_TARGET_ESP32S2
     register_command("blescan", handle_ble_scan_cmd);
+    register_command("blebridge", ble_bridge_handle_command);
     register_command("blewardriving", handle_ble_wardriving);
     register_command("listairtags", handle_list_airtags_cmd);
     register_command("selectairtag", handle_select_airtag);
@@ -10174,6 +10083,7 @@ void register_commands() {
     register_command("coredump", handle_coredump_cmd);
 #endif
     register_command("pineap", handle_pineap_detection);
+    register_command("wpa3check", handle_wpa3_compliance);
     register_command("apcred", handle_apcred);
     register_command("apenable", handle_ap_enable_cmd);
     register_command("chipinfo", handle_chip_info_cmd);
@@ -10197,6 +10107,7 @@ void register_commands() {
     register_command("selectgatt", handle_select_gatt_cmd);
     register_command("enumgatt", handle_enum_gatt_cmd);
     register_command("trackgatt", handle_track_gatt_cmd);
+    register_command("listadv", handle_list_advertisers_cmd);
 #endif
     register_command("trackap", handle_track_ap_cmd);
     register_command("tracksta", handle_track_sta_cmd);
@@ -10223,7 +10134,7 @@ void register_commands() {
     register_command("ir", handle_ir_cmd);
 #endif
     register_command("nrf24", handle_nrf24_cmd);
-    register_command("subghz", handle_subghz_cmd);
+    register_command("audio", handle_audio_cmd);
     register_command("badusb", handle_badusb_cmd);
 #ifdef CONFIG_WITH_ETHERNET
     register_command("ethup", handle_eth_up_cmd);
@@ -10270,332 +10181,9 @@ void register_commands() {
     register_command("camerastream", handle_camerastream_cmd);
 #endif
     register_command("loadconfig", handle_loadconfig_cmd);
+    register_command("apps", handle_apps_cmd);
 
-    esp_comm_manager_set_command_callback(comm_command_callback, NULL);
+    cmd_comm_register_callback();
 
     glog("Registered Commands\n");
 }
-
-#ifndef CONFIG_IDF_TARGET_ESP32S2
-void handle_ble_spam_cmd(int argc, char **argv) {
-    if (argc > 1) {
-        if (strcmp(argv[1], "-apple") == 0) {
-            glog("Starting Apple BLE spam...\n");
-            ble_spam_start(BLE_SPAM_APPLE);
-            return;
-        }
-        if (strcmp(argv[1], "-ms") == 0 || strcmp(argv[1], "-microsoft") == 0) {
-            glog("Starting Microsoft BLE spam...\n");
-            ble_spam_start(BLE_SPAM_MICROSOFT);
-            return;
-        }
-        if (strcmp(argv[1], "-samsung") == 0) {
-            glog("Starting Samsung BLE spam...\n");
-            ble_spam_start(BLE_SPAM_SAMSUNG);
-            return;
-        }
-        if (strcmp(argv[1], "-google") == 0) {
-            glog("Starting Google BLE spam...\n");
-            ble_spam_start(BLE_SPAM_GOOGLE);
-            return;
-        }
-        if (strcmp(argv[1], "-random") == 0) {
-            glog("Starting Random BLE spam...\n");
-            ble_spam_start(BLE_SPAM_RANDOM);
-            return;
-        }
-        if (strcmp(argv[1], "-s") == 0) {
-            glog("Stopping BLE spam...\n");
-            ble_spam_stop();
-            return;
-        }
-    }
-    glog("Usage: blespam [-apple|-ms|-samsung|-google|-random|-s]\n");
-}
-#endif
-
-void handle_listportals(int argc, char **argv) {
-    char portal_names[MAX_PORTALS][MAX_PORTAL_NAME];
-    int count = get_evil_portal_list(portal_names);
-
-    if (count <= 0) {
-        glog("No portals found.\n");
-        return;
-    }
-
-    glog("Available Evil Portals:\n");
-    for (int i = 0; i < count; ++i) {
-        glog("  %.508s\n", portal_names[i]);
-    }
-}
-
-void handle_evilportal(int argc, char **argv) {
-    if (argc < 3) {
-        glog("Usage: %s -c <command>\n", argv[0]);
-        glog("Commands:\n");
-        glog("  sethtmlstr - Set HTML content from buffer (use with UART markers)\n");
-        glog("  clear - Clear HTML buffer and disable buffer mode\n");
-        return;
-    }
-
-    if (strcmp(argv[1], "-c") != 0) {
-        glog("Error: Expected -c flag\n");
-        return;
-    }
-
-    if (strcmp(argv[2], "sethtmlstr") == 0) {
-        wifi_manager_set_html_from_uart();
-        glog("HTML buffer mode enabled for evil portal\n");
-    } else if (strcmp(argv[2], "clear") == 0) {
-        wifi_manager_clear_html_buffer();
-        glog("HTML buffer cleared - will use default portal on next startportal\n");
-    } else {
-        glog("Error: Unsupported command '%s'\n", argv[2]);
-    }
-}
-
-void handle_set_rgb_mode_cmd(int argc, char **argv) {
-    if (argc != 2) {
-        glog("Usage: setrgbmode <normal|rainbow|stealth>\n");
-        return;
-    }
-    RGBMode mode;
-    if (strcasecmp(argv[1], "normal") == 0) {
-        mode = RGB_MODE_NORMAL;
-    } else if (strcasecmp(argv[1], "rainbow") == 0) {
-        mode = RGB_MODE_RAINBOW;
-    } else if (strcasecmp(argv[1], "stealth") == 0) {
-        mode = RGB_MODE_STEALTH;
-    } else {
-        glog("Invalid mode '%s'. Supported modes: normal, rainbow, stealth\n", argv[1]);
-        return;
-    }
-    settings_set_rgb_mode(&G_Settings, mode);
-    settings_save(&G_Settings);
-    glog("RGB mode set to %s\n", argv[1]);
-}
-
-void handle_karma_cmd(int argc, char **argv) {
-    if (argc < 2) {
-        printf("Usage: karma <start|stop> [ssid1 ssid2 ...]\n");
-        TERMINAL_VIEW_ADD_TEXT("Usage: karma <start|stop> [ssid1 ssid2 ...]\n");
-        return;
-    }
-    if (strcmp(argv[1], "start") == 0) {
-        if (argc > 2) {
-            // User specified SSIDs
-            const char *ssid_list[32];
-            int ssid_count = 0;
-            for (int i = 2; i < argc && ssid_count < 32; ++i) {
-                if (strlen(argv[i]) > 0 && strlen(argv[i]) < 33) {
-                    ssid_list[ssid_count++] = argv[i];
-                }
-            }
-            if (ssid_count > 0) {
-                wifi_manager_set_karma_ssid_list(ssid_list, ssid_count);
-                printf("Karma SSID list set (%d):\n", ssid_count);
-                for (int i = 0; i < ssid_count; ++i) {
-                    printf("  %s\n", ssid_list[i]);
-                    TERMINAL_VIEW_ADD_TEXT("  %s\n", ssid_list[i]);
-                }
-            }
-        }
-        wifi_manager_start_karma();
-    } else if (strcmp(argv[1], "stop") == 0) {
-        wifi_manager_stop_karma();
-    } else {
-        printf("Usage: karma <start|stop> [ssid1 ssid2 ...]\n");
-        TERMINAL_VIEW_ADD_TEXT("Usage: karma <start|stop> [ssid1 ssid2 ...]\n");
-    }
-}
-
-void handle_set_neopixel_brightness_cmd(int argc, char **argv) {
-    if (argc != 2) {
-        glog("Usage: setneopixelbrightness <0-100>\n");
-        glog("Example: setneopixelbrightness 50\n");
-        return;
-    }
-    
-    int brightness = atoi(argv[1]);
-    if (brightness < 0 || brightness > 100) {
-        glog("Invalid brightness value '%s'. Must be between 0-100\n", argv[1]);
-        return;
-    }
-    
-    settings_set_neopixel_max_brightness(&G_Settings, (uint8_t)brightness);
-    settings_save(&G_Settings);
-    glog("Neopixel max brightness set to %d%%\n", brightness);
-}
-
-void handle_get_neopixel_brightness_cmd(int argc, char **argv) {
-    uint8_t brightness = settings_get_neopixel_max_brightness(&G_Settings);
-    glog("Current neopixel max brightness: %d%%\n", brightness);
-}
-
-#ifdef CONFIG_HAS_CAMERA
-void handle_motion_cmd(int argc, char **argv) {
-    if (argc < 2) {
-        glog("Usage: motion <command> [args]\n");
-        glog("Commands:\n");
-        glog("  motion start           - Start motion detection\n");
-        glog("  motion stop            - Stop motion detection\n");
-        glog("  motion status          - Show current state\n");
-        glog("  motion threshold <1-255>  - Set pixel diff threshold\n");
-        glog("  motion interval <100-10000> - Set interval in ms\n");
-        glog("  motion percent <1-100> - Set trigger percentage\n");
-        glog("  motion sample <1-32>   - Compare every Nth pixel\n");
-        glog("  motion snap <on|off>   - Enable/disable SD snapshots\n");
-        glog("  motion image <on|off>  - Attach image to Discord alert\n");
-        glog("  motion discord <url|off> - Send Discord embed alerts\n");
-        glog("  motion webhook <url|off> - Alias for discord/off\n");
-        glog("  motion cooldown <ms>    - Webhook alert cooldown\n");
-        return;
-    }
-
-    if (strcmp(argv[1], "start") == 0) {
-        camera_stream_stop();
-        esp_err_t ret = motion_detector_start();
-        if (ret == ESP_OK) {
-            glog("[MOTION] Started\n");
-        } else {
-            glog("[MOTION] Failed to start\n");
-        }
-    } else if (strcmp(argv[1], "stop") == 0) {
-        motion_detector_stop();
-    } else if (strcmp(argv[1], "status") == 0) {
-        MotionDetectorState state = motion_detector_get_state();
-        glog("[MOTION] Status:\n");
-        glog("  Running:    %s\n", state.is_running ? "YES" : "NO");
-        glog("  Threshold:  %d\n", state.threshold);
-        glog("  Interval:   %dms\n", state.interval_ms);
-        glog("  Trigger:    %d%%\n", state.trigger_percent);
-        glog("  Sample:     every %d pixel(s)\n", state.sample_step);
-        glog("  PSRAM:      %s\n", state.using_psram ? "YES" : "NO");
-        glog("  Snapshots:  %s\n", state.save_snapshots ? "ON" : "OFF");
-        glog("  Image:      %s\n", state.send_discord_image ? "ON" : "OFF");
-        glog("  Webhook:    %s\n", state.webhook_enabled ? "configured" : "OFF");
-        glog("  Cooldown:   %dms\n", state.webhook_cooldown_ms);
-        glog("  Events:     %d\n", state.motion_count);
-    } else if (strcmp(argv[1], "threshold") == 0) {
-        if (argc < 3) {
-            glog("Usage: motion threshold <1-255>\n");
-            return;
-        }
-        motion_detector_set_threshold(atoi(argv[2]));
-    } else if (strcmp(argv[1], "interval") == 0) {
-        if (argc < 3) {
-            glog("Usage: motion interval <100-10000>\n");
-            return;
-        }
-        motion_detector_set_interval(atoi(argv[2]));
-    } else if (strcmp(argv[1], "percent") == 0) {
-        if (argc < 3) {
-            glog("Usage: motion percent <1-100>\n");
-            return;
-        }
-        motion_detector_set_trigger_percent(atoi(argv[2]));
-    } else if (strcmp(argv[1], "sample") == 0) {
-        if (argc < 3) {
-            glog("Usage: motion sample <1-32>\n");
-            return;
-        }
-        motion_detector_set_sample_step(atoi(argv[2]));
-    } else if (strcmp(argv[1], "snap") == 0) {
-        if (argc < 3) {
-            glog("Usage: motion snap <on|off>\n");
-            return;
-        }
-        motion_detector_set_save_snapshots(strcmp(argv[2], "on") == 0);
-    } else if (strcmp(argv[1], "image") == 0) {
-        if (argc < 3) {
-            glog("Usage: motion image <on|off>\n");
-            return;
-        }
-        motion_detector_set_discord_image(strcmp(argv[2], "on") == 0);
-    } else if (strcmp(argv[1], "discord") == 0) {
-        if (argc < 3) {
-            glog("Usage: motion discord <discord_webhook_url|off>\n");
-            return;
-        }
-        if (strcmp(argv[2], "off") == 0) {
-            motion_detector_clear_webhook();
-        } else {
-            motion_detector_set_webhook(argv[2]);
-        }
-    } else if (strcmp(argv[1], "webhook") == 0) {
-        if (argc < 3) {
-            glog("Usage: motion webhook <url|off>\n");
-            return;
-        }
-        if (strcmp(argv[2], "off") == 0) {
-            motion_detector_clear_webhook();
-        } else {
-            motion_detector_set_webhook(argv[2]);
-        }
-    } else if (strcmp(argv[1], "cooldown") == 0) {
-        if (argc < 3) {
-            glog("Usage: motion cooldown <ms>\n");
-            return;
-        }
-        motion_detector_set_webhook_cooldown(atoi(argv[2]));
-    } else {
-        glog("Unknown motion command: %s\n", argv[1]);
-    }
-}
-
-void handle_camerastream_cmd(int argc, char **argv) {
-    if (argc < 2) {
-        glog("Usage: camerastream <command> [args]\n");
-        glog("Commands:\n");
-        glog("  camerastream start              - Start camera stream\n");
-        glog("  camerastream stop               - Stop camera stream\n");
-        glog("  camerastream status             - Show current state\n");
-        glog("  camerastream quality <1-100>    - Set JPEG quality\n");
-        glog("  camerastream resolution <name>  - Set resolution\n");
-        glog("  camerastream fps <1-30>         - Set target FPS\n");
-        glog("  Resolutions: QQVGA QVGA VGA SVGA XGA SXGA UXGA\n");
-        return;
-    }
-
-    if (strcmp(argv[1], "start") == 0) {
-        esp_err_t ret = camera_stream_start();
-        if (ret == ESP_OK) {
-            glog("[CAM_STREAM] Started - visit http://ghostesp.local/camera\n");
-        } else {
-            glog("[CAM_STREAM] Failed to start\n");
-        }
-    } else if (strcmp(argv[1], "stop") == 0) {
-        camera_stream_stop();
-    } else if (strcmp(argv[1], "status") == 0) {
-        CameraStreamState st = camera_stream_get_state();
-        glog("[CAM_STREAM] Status:\n");
-        glog("  Running:    %s\n", st.is_running ? "YES" : "NO");
-        glog("  Quality:    %d\n", st.quality);
-        glog("  Resolution: %d (config)\n", st.frame_size);
-        glog("  Target FPS: %d\n", st.fps_target);
-        glog("  PSRAM:      %s\n", st.using_psram ? "YES" : "NO");
-        glog("  Client:     %s\n", st.client_count > 0 ? "connected" : "none");
-        glog("  Frames:     %d\n", st.frames_sent);
-    } else if (strcmp(argv[1], "quality") == 0) {
-        if (argc < 3) {
-            glog("Usage: camerastream quality <1-100>\n");
-            return;
-        }
-        camera_stream_set_quality(atoi(argv[2]));
-    } else if (strcmp(argv[1], "resolution") == 0) {
-        if (argc < 3) {
-            glog("Usage: camerastream resolution <QQVGA|QVGA|VGA|SVGA|XGA|SXGA|UXGA>\n");
-            return;
-        }
-        camera_stream_set_framesize(argv[2]);
-    } else if (strcmp(argv[1], "fps") == 0) {
-        if (argc < 3) {
-            glog("Usage: camerastream fps <1-30>\n");
-            return;
-        }
-        camera_stream_set_fps(atoi(argv[2]));
-    } else {
-        glog("Unknown camerastream command: %s\n", argv[1]);
-    }
-}
-#endif

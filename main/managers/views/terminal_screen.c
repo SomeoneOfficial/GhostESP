@@ -1,6 +1,7 @@
 #include "managers/views/terminal_screen.h"
 #include "core/serial_manager.h"
 #include "core/commandline.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -27,12 +28,23 @@ static View *terminal_return_view = NULL;
 
 #include "lvgl.h"
 #include "managers/settings_manager.h"
+#include "gui/accessibility_fonts.h"
+#include "gui/theme_palette_api.h"
 
 // Function declarations
 static void submit_text();
 static void add_char_to_buffer(char c);
 static void update_input_label();
 static void keyboard_input_callback(const char *text);
+
+static const lv_font_t *terminal_font(void) {
+    uint8_t size = settings_get_terminal_font_size(&G_Settings);
+    switch (size) {
+        case 0: return &lv_font_montserrat_10;
+        case 2: return &lv_font_montserrat_14;
+        default: return &lv_font_montserrat_12;
+    }
+}
 
 static const char *TAG = "Terminal";
 static lv_obj_t *terminal_scroller = NULL;
@@ -48,8 +60,8 @@ static bool terminal_dualcomm_only = false;
 #define PROCESSING_INTERVAL_MS 10
 #define PROCESSING_INTERVAL_FAST_MS 5
 #define MIN_SCREEN_SIZE 239
-#define BUTTON_SIZE 40
-#define BUTTON_PADDING 5
+#define BUTTON_SIZE 28
+#define BUTTON_PADDING 3
 
 static lv_obj_t *back_btn = NULL;
 static lv_obj_t *input_label = NULL;
@@ -93,6 +105,8 @@ static void scroll_terminal_up(void);
 static void scroll_terminal_down(void);
 static void stop_all_operations(void);
 static bool terminal_is_near_bottom(void);
+static bool terminal_is_dualcomm_line(const char *text);
+static const char *terminal_dualcomm_display_text(const char *text);
 
 // Additional function predefs
 static void recalc_layout_if_needed(void);
@@ -119,9 +133,10 @@ static lv_obj_t *terminal_canvas = NULL;
 typedef struct {
   char *text;
   uint16_t pxh; // cached pixel height at last layout width
+  bool is_dualcomm; // precomputed at insert time, read in draw callback
 } TermLine;
 
-static TermLine term_lines[MAX_TERMINAL_LINES];
+static TermLine *term_lines = NULL;
 static uint16_t term_line_head = 0;   // index of oldest
 static uint16_t term_line_count = 0;  // number of valid lines
 static size_t term_text_bytes = 0;    // total bytes across stored lines
@@ -147,16 +162,27 @@ static void *terminal_alloc_buffer(size_t size) {
 }
 
 static bool ensure_terminal_buffers(void) {
-  if (term_ring) {
+  if (term_ring && term_lines) {
     return true;
   }
 
-  term_ring = terminal_alloc_buffer(MAX_TEXT_LENGTH);
+  if (!term_ring) {
+    term_ring = terminal_alloc_buffer(MAX_TEXT_LENGTH);
+  }
   if (!term_ring) {
     ESP_LOGE(TAG, "Failed to allocate terminal ring buffer");
     return false;
   }
   memset(term_ring, 0, MAX_TEXT_LENGTH);
+
+  if (!term_lines) {
+    term_lines = terminal_alloc_buffer(sizeof(TermLine) * MAX_TERMINAL_LINES);
+  }
+  if (!term_lines) {
+    ESP_LOGE(TAG, "Failed to allocate terminal line buffer");
+    return false;
+  }
+  memset(term_lines, 0, sizeof(TermLine) * MAX_TERMINAL_LINES);
 
   return true;
 }
@@ -255,6 +281,7 @@ static void scroll_to_bottom_if_needed(bool was_near_bottom) {
 // ========== Virtualized terminal helpers ==========
 
 static void clear_lines(void) {
+  if (!term_lines) return;
   for (uint16_t i = 0; i < term_line_count; i++) {
     uint16_t idx = (term_line_head + i) % MAX_TERMINAL_LINES;
     if (term_lines[idx].text) {
@@ -269,7 +296,7 @@ static void clear_lines(void) {
 }
 
 static void drop_oldest_line(void) {
-  if (term_line_count == 0) return;
+  if (!term_lines || term_line_count == 0) return;
   uint16_t idx = term_line_head;
   if (term_lines[idx].text) {
     term_text_bytes -= strlen(term_lines[idx].text);
@@ -282,6 +309,7 @@ static void drop_oldest_line(void) {
 }
 
 static void append_line(const char *line, size_t len) {
+  if (!ensure_terminal_buffers()) return;
   // allocate and copy
   char *copy = (char *)malloc(len + 1);
   if (!copy) return;
@@ -299,6 +327,7 @@ static void append_line(const char *line, size_t len) {
   uint16_t idx = (term_line_head + term_line_count) % MAX_TERMINAL_LINES;
   term_lines[idx].text = copy;
   term_lines[idx].pxh = 0; // recalc lazily
+  term_lines[idx].is_dualcomm = terminal_is_dualcomm_line(copy);
   term_line_count++;
   term_text_bytes += len;
 }
@@ -343,8 +372,7 @@ static void terminal_push_incoming(const char *data, size_t len) {
   }
 }
 
-static bool terminal_is_dualcomm_line(const char *text);
-static const char *terminal_dualcomm_display_text(const char *text);
+
 
 static bool terminal_should_use_split_view(void) {
     return terminal_dualcomm_only && settings_get_ghostlink_split_view(&G_Settings);
@@ -450,12 +478,12 @@ static void terminal_canvas_draw_event(lv_event_t *e) {
       uint16_t idx = (term_line_head + i) % MAX_TERMINAL_LINES;
       TermLine *L = &term_lines[idx];
       lv_coord_t h = L->pxh;
-      const char *txt = (L->text && L->text[0]) ? L->text : " ";
-      if (terminal_is_dualcomm_line(txt)) {
+      if (L->is_dualcomm) {
         continue; // skip Dual Comm lines in left column
       }
       if ((y_left + h) < local_top) { y_left += h; continue; }
       if (y_left > local_bottom) break;
+      const char *txt = (L->text && L->text[0]) ? L->text : " ";
       lv_area_t a;
       a.x1 = obj_coords.x1;
       a.y1 = obj_coords.y1 + y_left;
@@ -471,12 +499,12 @@ static void terminal_canvas_draw_event(lv_event_t *e) {
       uint16_t idx = (term_line_head + i) % MAX_TERMINAL_LINES;
       TermLine *L = &term_lines[idx];
       lv_coord_t h = L->pxh;
-      const char *txt = (L->text && L->text[0]) ? L->text : " ";
-      if (!terminal_is_dualcomm_line(txt)) {
+      if (!L->is_dualcomm) {
         continue; // skip non-Dual lines in right column
       }
       if ((y_right + h) < local_top) { y_right += h; continue; }
       if (y_right > local_bottom) break;
+      const char *txt = (L->text && L->text[0]) ? L->text : " ";
       const char *s = terminal_dualcomm_display_text(txt);
       lv_area_t b;
       b.x1 = obj_coords.x1 + col_w;
@@ -612,9 +640,6 @@ static void stop_all_operations(void) {
 }
 #if defined(CONFIG_USE_HW_KB) || defined(CONFIG_USE_TOUCHSCREEN) || defined(CONFIG_USE_JOYSTICK)
 void text_box_click_cb(lv_event_t *e){
-  ESP_LOGI(TAG, "Text box clicked");
-  printf("Text box clicked\n");
-
   keyboard_view_set_return_view(&terminal_view);
   keyboard_view_set_start_caps(false);
   display_manager_switch_view(&keyboard_view);
@@ -650,9 +675,13 @@ void terminal_view_create(void) {
 
     terminal_view.root = gui_screen_create_root(NULL, "Terminal", lv_color_black(), LV_OPA_COVER);
 
+    uint8_t theme = settings_get_menu_theme(&G_Settings);
+    lv_color_t control_bg = lv_color_hex(theme_palette_get_surface_alt(theme));
+    lv_color_t control_text = lv_color_hex(theme_palette_get_text(theme));
+
     const int STATUS_BAR_HEIGHT = GUI_STATUS_BAR_HEIGHT;
-    const int padding = 5;
-    const int textbox_height = 40;
+    const int padding = 3;
+    const int textbox_height = 28;
 
     int back_button_height = 0;
     bool show_back_btn = false;
@@ -709,7 +738,7 @@ void terminal_view_create(void) {
     lv_obj_set_style_border_width(terminal_canvas, 0, 0);
     // Match previous label style
     lv_obj_set_style_text_color(terminal_canvas, lv_color_hex(settings_get_terminal_text_color(&G_Settings)), 0);
-    lv_obj_set_style_text_font(terminal_canvas, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_font(terminal_canvas, terminal_font(), 0);
     lv_obj_add_event_cb(terminal_canvas, terminal_canvas_draw_event, LV_EVENT_DRAW_MAIN, NULL);
     lv_obj_add_event_cb(terminal_canvas, terminal_canvas_size_event, LV_EVENT_SIZE_CHANGED, NULL);
     lv_obj_add_event_cb(terminal_scroller, terminal_canvas_size_event, LV_EVENT_SIZE_CHANGED, NULL);
@@ -720,13 +749,14 @@ void terminal_view_create(void) {
         back_btn = lv_btn_create(terminal_view.root);
         lv_obj_set_size(back_btn, BUTTON_SIZE, BUTTON_SIZE);
         lv_obj_align(back_btn, LV_ALIGN_BOTTOM_LEFT, BUTTON_PADDING, -BUTTON_PADDING);
-        lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(back_btn, control_bg, LV_PART_MAIN);
         lv_obj_set_style_radius(back_btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
         lv_obj_add_event_cb(back_btn, back_btn_event_cb, LV_EVENT_CLICKED, NULL);
         lv_obj_set_style_border_width(back_btn, 0, LV_PART_MAIN);
         lv_obj_set_style_shadow_width(back_btn, 0, LV_PART_MAIN);
         lv_obj_t *back_label = lv_label_create(back_btn);
         lv_label_set_text(back_label, LV_SYMBOL_LEFT);
+        lv_obj_set_style_text_color(back_label, control_text, 0);
         lv_obj_center(back_label);
 
         lv_obj_update_layout(terminal_view.root);
@@ -748,11 +778,12 @@ void terminal_view_create(void) {
 
         input_label = lv_label_create(terminal_view.root);
         lv_obj_set_size(input_label, textbox_width, textbox_height);
-        lv_obj_set_style_bg_color(input_label, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_bg_color(input_label, control_bg, 0);
         lv_obj_set_style_bg_opa(input_label, LV_OPA_COVER, 0);
-        lv_obj_set_style_text_color(input_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_color(input_label, control_text, 0);
         lv_obj_set_style_pad_all(input_label, padding, 0);
-        lv_obj_set_style_radius(input_label, 0, 0);
+        lv_obj_set_style_radius(input_label, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_text_align(input_label, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_border_width(input_label, 0, 0);
         lv_obj_set_style_shadow_width(input_label, 0, 0);
         lv_obj_align(input_label, LV_ALIGN_BOTTOM_RIGHT, -padding, -padding);

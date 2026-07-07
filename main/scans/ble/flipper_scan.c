@@ -16,6 +16,7 @@
 #include "managers/ble_manager.h"
 #include "managers/rgb_manager.h"
 #include "managers/status_display_manager.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
@@ -58,7 +59,7 @@ typedef struct {
     int8_t rssi;
 } FlipperDevice;
 
-static FlipperDevice discovered_flippers[MAX_FLIPPERS];
+EXT_RAM_BSS_ATTR static FlipperDevice discovered_flippers[MAX_FLIPPERS];
 static int discovered_flipper_count = 0;
 static int selected_flipper_index = -1;
 static volatile bool flipper_scan_active = false;
@@ -320,7 +321,7 @@ static void ble_findtheflippers_callback(struct ble_gap_event *event, size_t len
              discovered_flipper_count, type_str,
 advertisementMac, advertisementName, advertisementRssi);
         // Avoid blocking the NimBLE host task inside the discovery callback.
-        rgb_manager_set_color(&rgb_manager, -1, 255, 165, 0, false);
+        rgb_manager_pulse_async(&rgb_manager, 255, 165, 0);
         discovered_flipper_count++;
     }
 }

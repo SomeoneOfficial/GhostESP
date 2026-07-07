@@ -132,10 +132,50 @@ typedef enum {
     SETTING_GHOSTLINK_SPLIT_VIEW,
     SETTING_MENU_BG_SHADE,
     SETTING_MENU_ROUNDED,
+    SETTING_EPILEPSY_WARNING,
+    SETTING_FONT_SIZE,
+    SETTING_REDUCED_MOTION,
+    SETTING_INPUT_REPEAT_SPEED,
+    SETTING_HIGH_CONTRAST,
     SETTING_MENU_ITEM_BORDERS,
+    SETTING_MENU_CARD_BG,
+    SETTING_TOUCH_DRAG_SCROLL,
+    SETTING_TERMINAL_FONT_SIZE,
+    SETTING_RELOAD_ASSET_PACK,
+    SETTING_CAROUSEL_INVERT_DIRECTION,
     SETTING_EXPORT_SETTINGS_SD,
     SETTING_IMPORT_SETTINGS_SD,
+    // Lockscreen settings
+    SETTING_LOCKSCREEN_ENABLED,
+    SETTING_LOCKSCREEN_WAKE,
+    SETTING_LOCKSCREEN_TYPE,
+    SETTING_LOCKSCREEN_TIMEOUT,
+    SETTING_LOCKSCREEN_CHANGE_PIN,
+    // Wardriving settings
+    SETTING_WD_HOP_PRIMARY,
+    SETTING_WD_HOP_HELPER,
+    SETTING_WD_WEIGHTED_5G,
+    SETTING_GPS_BAUD_RATE,
+    // On-device edit actions for existing NVS-backed fields
+    SETTING_AP_SSID,
+    SETTING_AP_PASSWORD,
+    SETTING_STA_SSID,
+    SETTING_STA_PASSWORD,
+    // Timezone quick-edit
+    SETTING_TIMEZONE,
+    // OTA firmware update
+    SETTING_OTA_CHANNEL,
+    SETTING_OTA_UPDATE_AVAILABLE,
+    SETTING_OTA_LAST_CHECK_TIME,
+    // OTA UI actions (not NVS-backed -- handled entirely in options_screen.c)
+    SETTING_OTA_CHECK_NOW,
+    SETTING_OTA_INSTALL_UPDATE,
+    SETTING_OTA_CHECK_PEER,
+    SETTING_OTA_UPDATE_PEER,
+    SETTING_OTA_INSTALL_FROM_SD,
 } SettingsType;
+
+#define GPS_BAUD_AUTO 1U
 
 
 typedef enum {
@@ -198,6 +238,7 @@ typedef struct {
   char selected_timezone[25];
   char selected_hex_accent_color[25];
   int gps_rx_pin;
+  uint32_t gps_baud_rate;      // 0 = use Kconfig default (CONFIG_GPS_UART_BAUD_RATE)
   uint32_t display_timeout_ms; // Display timeout in milliseconds
   bool rts_enabled;
   char sta_ssid[65];     // New field for Station SSID (Max 64 + null)
@@ -210,6 +251,7 @@ typedef struct {
   int32_t rgb_blue_pin;  // Separate-pin RGB: blue pin, -1 if not used
   bool third_control_enabled;  // Enable third-screen tap control
   uint32_t terminal_text_color; // Terminal text color in 0xRRGGBB
+  uint8_t terminal_font_size;   // 0=Small, 1=Normal, 2=Large
   uint8_t menu_theme;  // Theme for main menu colors (0=Default)
   bool invert_colors; // Invert screen colors
   bool web_auth_enabled;
@@ -228,6 +270,7 @@ typedef struct {
   // Navigation buttons setting
   bool nav_buttons_enabled; // Toggle for main menu navigation buttons
   uint8_t menu_layout; // Menu layout type (0=Carousel, 1=Grid Cards, 2=List)
+  bool carousel_invert_direction; // Invert main menu carousel slide direction
   
   // Neopixel settings
   uint8_t neopixel_max_brightness; // Max neopixel brightness (0-100)
@@ -245,6 +288,11 @@ typedef struct {
   char wigle_api_key[129];
   bool wigle_auto_upload; // Auto-upload CSVs at boot when WiFi connected
   bool wigle_donate; // Whether to donate uploads to Wigle
+
+  // OTA firmware update (8MB/16MB boards only, see ota_manager)
+  uint8_t ota_channel;          // 0=stable, 1=prerelease
+  bool ota_update_available;    // set by the background update-check task
+  uint32_t ota_last_check_time; // unix timestamp of last background check
   // IO expander programmable buttons (P10, P11, P12) - command to run when pressed, empty = send as joystick
   char io_btn_p10_cmd[129];
   char io_btn_p11_cmd[129];
@@ -267,14 +315,34 @@ typedef struct {
     bool ghostlink_split_view;      // Split GhostLink terminal into two columns
     uint8_t menu_bg_shade;          // 0=Darkest, 1=Darker, 2=Dark, 3=Medium
     bool menu_rounded;              // Rounded corners on menu items
+    bool epilepsy_warning_enabled;  // Show warning before flashing LED effects
+    uint8_t font_size;              // 0=Small, 1=Normal, 2=Large
+    bool reduced_motion;            // Disable animations
+    uint8_t input_repeat_speed;     // 0=Slow, 1=Normal, 2=Fast
+    bool high_contrast;             // High contrast color overrides
     bool menu_item_borders;          // Borders around main menu items
+    bool menu_card_bg;               // Card background fill/shadow on main menu items
+    bool touch_drag_scroll;          // Drag-to-scroll on the options screen
+
+    // Lockscreen settings
+    bool lockscreen_enabled;
+    uint8_t lockscreen_type;        // 1=PIN; kept for persisted settings compatibility
+    char lockscreen_obfuscated[32]; // Length-prefixed obfuscated PIN blob
+    uint16_t lockscreen_timeout_sec;   // Auto-lock after inactivity (0=off)
+    bool lockscreen_wake_lock;        // Lock on wake-from-sleep
+
+    // Wardriving settings
+    uint16_t wd_hop_primary_ms;      // Primary chip hop interval (50-500ms)
+    uint16_t wd_hop_helper_ms;       // Helper chip hop interval (50-500ms)
+    bool wd_weighted_5g;             // Weighted 5GHz channel hopping
 } FSettings;
 
 // Function declarations
 void settings_init(FSettings *settings);
 void settings_deinit(void);
 void settings_load(FSettings *settings);
-void settings_save(const FSettings *settings);
+esp_err_t settings_save(const FSettings *settings);
+void settings_save_sta_credentials(const FSettings *settings);
 void settings_set_defaults(FSettings *settings);
 
 // Optimized Persistence and Task Management
@@ -324,6 +392,9 @@ const char *settings_get_portal_ssid(const FSettings *settings);
 
 void settings_set_gps_rx_pin(FSettings *settings, uint8_t RxPin);
 uint8_t settings_get_gps_rx_pin(const FSettings *settings);
+
+void settings_set_gps_baud_rate(FSettings *settings, uint32_t baud);
+uint32_t settings_get_gps_baud_rate(const FSettings *settings);
 
 void settings_set_portal_password(FSettings *settings, const char *password);
 const char *settings_get_portal_password(const FSettings *settings);
@@ -376,6 +447,8 @@ uint8_t settings_get_menu_theme(const FSettings *settings);
 
 void settings_set_terminal_text_color(FSettings *settings, uint32_t color);
 uint32_t settings_get_terminal_text_color(const FSettings *settings);
+void settings_set_terminal_font_size(FSettings *settings, uint8_t size);
+uint8_t settings_get_terminal_font_size(const FSettings *settings);
 void settings_set_invert_colors(FSettings *settings, bool enabled);
 bool settings_get_invert_colors(const FSettings *settings);
 
@@ -422,6 +495,10 @@ bool settings_get_nav_buttons_enabled(const FSettings *settings);
 void settings_set_menu_layout(FSettings *settings, uint8_t layout);
 uint8_t settings_get_menu_layout(const FSettings *settings);
 
+// Carousel slide direction inversion settings
+void settings_set_carousel_invert_direction(FSettings *settings, bool enabled);
+bool settings_get_carousel_invert_direction(const FSettings *settings);
+
 // Neopixel brightness settings
 void settings_set_neopixel_max_brightness(FSettings *settings, uint8_t brightness);
 uint8_t settings_get_neopixel_max_brightness(const FSettings *settings);
@@ -441,6 +518,13 @@ uint8_t settings_get_wifi_country(const FSettings *settings);
 
 void settings_set_wigle_auto_upload(FSettings *settings, bool enabled);
 bool settings_get_wigle_auto_upload(const FSettings *settings);
+
+void settings_set_ota_channel(FSettings *settings, uint8_t channel);
+uint8_t settings_get_ota_channel(const FSettings *settings);
+void settings_set_ota_update_available(FSettings *settings, bool available);
+bool settings_get_ota_update_available(const FSettings *settings);
+void settings_set_ota_last_check_time(FSettings *settings, uint32_t timestamp);
+uint32_t settings_get_ota_last_check_time(const FSettings *settings);
 void settings_set_wigle_donate(FSettings *settings, bool enabled);
 bool settings_get_wigle_donate(const FSettings *settings);
 
@@ -500,9 +584,43 @@ void settings_set_menu_bg_shade(FSettings *settings, uint8_t shade);
 uint8_t settings_get_menu_bg_shade(const FSettings *settings);
 void settings_set_menu_rounded(FSettings *settings, bool enabled);
 bool settings_get_menu_rounded(const FSettings *settings);
+void settings_set_epilepsy_warning_enabled(FSettings *settings, bool enabled);
+bool settings_get_epilepsy_warning_enabled(const FSettings *settings);
 
+void settings_set_font_size(FSettings *settings, uint8_t size);
+uint8_t settings_get_font_size(const FSettings *settings);
+void settings_set_reduced_motion(FSettings *settings, bool enabled);
+bool settings_get_reduced_motion(const FSettings *settings);
+void settings_set_input_repeat_speed(FSettings *settings, uint8_t speed);
+uint8_t settings_get_input_repeat_speed(const FSettings *settings);
+void settings_set_high_contrast(FSettings *settings, bool enabled);
+bool settings_get_high_contrast(const FSettings *settings);
 void settings_set_menu_item_borders(FSettings *settings, bool enabled);
 bool settings_get_menu_item_borders(const FSettings *settings);
+void settings_set_menu_card_bg(FSettings *settings, bool enabled);
+bool settings_get_menu_card_bg(const FSettings *settings);
+void settings_set_touch_drag_scroll(FSettings *settings, bool enabled);
+bool settings_get_touch_drag_scroll(const FSettings *settings);
+
+// Lockscreen getters and setters
+void settings_set_lockscreen_enabled(FSettings *settings, bool enabled);
+bool settings_get_lockscreen_enabled(const FSettings *settings);
+void settings_set_lockscreen_type(FSettings *settings, uint8_t type);
+uint8_t settings_get_lockscreen_type(const FSettings *settings);
+void settings_set_lockscreen_obfuscated(FSettings *settings, const char *obf);
+const char *settings_get_lockscreen_obfuscated(const FSettings *settings);
+void settings_set_lockscreen_timeout_sec(FSettings *settings, uint16_t sec);
+uint16_t settings_get_lockscreen_timeout_sec(const FSettings *settings);
+void settings_set_lockscreen_wake_lock(FSettings *settings, bool enabled);
+bool settings_get_lockscreen_wake_lock(const FSettings *settings);
+
+// Wardriving settings
+void settings_set_wd_hop_primary_ms(FSettings *settings, uint16_t ms);
+uint16_t settings_get_wd_hop_primary_ms(const FSettings *settings);
+void settings_set_wd_hop_helper_ms(FSettings *settings, uint16_t ms);
+uint16_t settings_get_wd_hop_helper_ms(const FSettings *settings);
+void settings_set_wd_weighted_5g(FSettings *settings, bool enabled);
+bool settings_get_wd_weighted_5g(const FSettings *settings);
 
 extern FSettings G_Settings;
 
