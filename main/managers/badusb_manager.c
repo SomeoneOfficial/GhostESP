@@ -272,6 +272,45 @@ bool badusb_hid_mouse_wheel_send(int8_t wheel, uint8_t buttons) {
     return tud_hid_n_mouse_report(HID_INSTANCE_MOUSE, 0, buttons, 0, 0, wheel, 0);
 }
 
+static void badusb_send_mouse_delta_chunked(int dx, int dy, uint8_t buttons) {
+    while (dx != 0 || dy != 0) {
+        int chunk_x = dx;
+        int chunk_y = dy;
+
+        if (chunk_x > 127) chunk_x = 127;
+        if (chunk_x < -128) chunk_x = -128;
+        if (chunk_y > 127) chunk_y = 127;
+        if (chunk_y < -128) chunk_y = -128;
+
+        if (!badusb_hid_mouse_send((int8_t)chunk_x, (int8_t)chunk_y, buttons)) {
+            return;
+        }
+
+        dx -= chunk_x;
+        dy -= chunk_y;
+        if (dx != 0 || dy != 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+}
+
+static void badusb_send_mouse_wheel_chunked(int delta, uint8_t buttons) {
+    while (delta != 0) {
+        int chunk = delta;
+        if (chunk > 127) chunk = 127;
+        if (chunk < -128) chunk = -128;
+
+        if (!badusb_hid_mouse_wheel_send((int8_t)chunk, buttons)) {
+            return;
+        }
+
+        delta -= chunk;
+        if (delta != 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+}
+
 // --- Mouse Jiggler ---
 
 static TaskHandle_t s_jiggler_task = NULL;
@@ -433,14 +472,7 @@ bool badusb_manager_is_trackpad(void) {
 
 void badusb_manager_trackpad_move(int dx, int dy) {
     if (!s_trackpad_active) return;
-    // The HID boot mouse report is 1 byte per axis, so saturate each axis to
-    // int8. Excess magnitude is dropped - the caller is expected to chunk
-    // large drags into successive reports if needed.
-    if (dx > 127) dx = 127;
-    if (dx < -128) dx = -128;
-    if (dy > 127) dy = 127;
-    if (dy < -128) dy = -128;
-    badusb_hid_mouse_send((int8_t)dx, (int8_t)dy, s_trackpad_buttons);
+    badusb_send_mouse_delta_chunked(dx, dy, s_trackpad_buttons);
 }
 
 void badusb_manager_trackpad_button(uint8_t buttons) {
@@ -453,10 +485,7 @@ void badusb_manager_trackpad_button(uint8_t buttons) {
 
 void badusb_manager_trackpad_wheel(int delta) {
     if (!s_trackpad_active) return;
-    // Boot-mouse wheel byte is 8-bit signed (range -128..+127).
-    if (delta > 127) delta = 127;
-    if (delta < -128) delta = -128;
-    badusb_hid_mouse_wheel_send((int8_t)delta, s_trackpad_buttons);
+    badusb_send_mouse_wheel_chunked(delta, s_trackpad_buttons);
 }
 
 // --- Keyboard Mode (real-time key forwarding) ---
@@ -750,7 +779,9 @@ static void badusb_exec_task(void *arg) {
     exec_task_params_t *params = (exec_task_params_t *)arg;
 
     s_stop_requested = false;
-    s_usb_mode = params->clicker ? BADUSB_USB_MODE_MOUSE : BADUSB_USB_MODE_KEYBOARD;
+    // Keep a stable composite HID identity for clicker runs; the clicker only
+    // needs the mouse interface from the shared descriptor.
+    s_usb_mode = BADUSB_USB_MODE_KEYBOARD;
 
     // If VSENSE is available, wait for USB cable to be plugged in BEFORE
     // installing TinyUSB.  The ESP32-S3 internal PHY needs VBUS present for

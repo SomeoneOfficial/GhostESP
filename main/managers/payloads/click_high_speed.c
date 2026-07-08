@@ -6,9 +6,11 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_rom_sys.h"
 #include "tusb.h"
 
 #define CLICK_HIGH_SPEED_RELEASE_TIMEOUT_MS 100
+#define CLICK_HIGH_SPEED_PRESS_HOLD_US 5000
 #define CLICK_HIGH_SPEED_TASK_STACK 4096
 #define CLICK_HIGH_SPEED_TASK_PRIORITY 6
 
@@ -66,12 +68,19 @@ static bool click_high_speed_click_once(void) {
         return false;
     }
 
+    esp_rom_delay_us(CLICK_HIGH_SPEED_PRESS_HOLD_US);
+
     if (!click_high_speed_should_continue()) {
         (void)click_high_speed_release();
         return false;
     }
 
-    return click_high_speed_release();
+    if (!click_high_speed_release()) {
+        return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+    return true;
 }
 
 static void click_high_speed_task(void *arg) {
