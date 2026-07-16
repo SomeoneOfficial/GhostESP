@@ -116,17 +116,17 @@ enum {
 static const uint8_t keyboard_configuration_descriptor[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, BADUSB_CONFIG_TOTAL_LEN, 0x00, 100),
     TUD_HID_DESCRIPTOR(ITF_NUM_HID_KEYBOARD, 0, HID_ITF_PROTOCOL_KEYBOARD,
-                       sizeof(hid_keyboard_report_desc), EPNUM_HID_KEYBOARD, CFG_TUD_HID_EP_BUFSIZE, 10),
+                       sizeof(hid_keyboard_report_desc), EPNUM_HID_KEYBOARD, CFG_TUD_HID_EP_BUFSIZE, 1),
     TUD_HID_DESCRIPTOR(ITF_NUM_HID_MOUSE, 0, HID_ITF_PROTOCOL_MOUSE,
-                       sizeof(hid_mouse_report_desc), EPNUM_HID_MOUSE, CFG_TUD_HID_EP_BUFSIZE, 10),
+                       sizeof(hid_mouse_report_desc), EPNUM_HID_MOUSE, CFG_TUD_HID_EP_BUFSIZE, 1),
 };
 
 static const uint8_t mouse_configuration_descriptor[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, BADUSB_CONFIG_TOTAL_LEN, 0x00, 100),
-    TUD_HID_DESCRIPTOR(ITF_NUM_HID_KEYBOARD, 0, HID_ITF_PROTOCOL_KEYBOARD,
-                       sizeof(hid_keyboard_report_desc), EPNUM_HID_KEYBOARD, CFG_TUD_HID_EP_BUFSIZE, 10),
     TUD_HID_DESCRIPTOR(ITF_NUM_HID_MOUSE, 0, HID_ITF_PROTOCOL_MOUSE,
-                       sizeof(hid_mouse_report_desc), EPNUM_HID_MOUSE, CFG_TUD_HID_EP_BUFSIZE, 10),
+                       sizeof(hid_mouse_report_desc), EPNUM_HID_MOUSE, CFG_TUD_HID_EP_BUFSIZE, 1),
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID_KEYBOARD, 0, HID_ITF_PROTOCOL_KEYBOARD,
+                       sizeof(hid_keyboard_report_desc), EPNUM_HID_KEYBOARD, CFG_TUD_HID_EP_BUFSIZE, 1),
 };
 
 static char mfr_string[33] = "Ghost ESP";
@@ -139,9 +139,25 @@ static const char *string_descriptors[] = {
     [3] = "000001",
 };
 
+uint8_t badusb_manager_mouse_interface(void) {
+    uint8_t preferred = (s_usb_mode == BADUSB_USB_MODE_MOUSE) ? 0 : ITF_NUM_HID_MOUSE;
+    if (preferred < CFG_TUD_HID && tud_hid_n_interface_protocol(preferred) == HID_ITF_PROTOCOL_MOUSE) {
+        return preferred;
+    }
+
+    for (uint8_t instance = 0; instance < CFG_TUD_HID; instance++) {
+        if (tud_hid_n_interface_protocol(instance) == HID_ITF_PROTOCOL_MOUSE) {
+            return instance;
+        }
+    }
+    return ITF_NUM_HID_MOUSE;
+}
+
 const uint8_t *tud_hid_descriptor_report_cb(uint8_t instance) {
-    if (instance == ITF_NUM_HID_MOUSE) return hid_mouse_report_descriptor;
-    return hid_keyboard_report_descriptor;
+    if (s_usb_mode == BADUSB_USB_MODE_MOUSE) {
+        return (instance == 0) ? hid_mouse_report_descriptor : hid_keyboard_report_descriptor;
+    }
+    return (instance == ITF_NUM_HID_MOUSE) ? hid_mouse_report_descriptor : hid_keyboard_report_descriptor;
 }
 
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
@@ -177,12 +193,13 @@ static bool badusb_send_key(uint8_t modifiers, uint8_t keycode, void *ctx) {
 }
 
 static bool badusb_wait_for_mouse_ready(uint32_t timeout_ms) {
+    uint8_t mouse_interface = badusb_manager_mouse_interface();
     uint32_t waited_ms = 0;
-    while (!tud_hid_n_ready(HID_INSTANCE_MOUSE) && waited_ms < timeout_ms && !s_stop_requested) {
+    while (!tud_hid_n_ready(mouse_interface) && waited_ms < timeout_ms && !s_stop_requested) {
         vTaskDelay(pdMS_TO_TICKS(1));
         waited_ms++;
     }
-    return tud_hid_n_ready(HID_INSTANCE_MOUSE) && !s_stop_requested;
+    return tud_hid_n_ready(mouse_interface) && !s_stop_requested;
 }
 
 static bool badusb_send_string(const char *text, size_t len, void *ctx) {
@@ -262,14 +279,40 @@ bool badusb_hid_mouse_send(int8_t dx, int8_t dy, uint8_t buttons) {
     if (!s_active) return false;
     if (!badusb_wait_for_mouse_ready(100)) return false;
 
-    return tud_hid_n_mouse_report(HID_INSTANCE_MOUSE, 0, buttons, dx, dy, 0, 0);
+    return tud_hid_n_mouse_report(badusb_manager_mouse_interface(), 0, buttons, dx, dy, 0, 0);
 }
 
 bool badusb_hid_mouse_wheel_send(int8_t wheel, uint8_t buttons) {
     if (!s_active) return false;
     if (!badusb_wait_for_mouse_ready(100)) return false;
 
-    return tud_hid_n_mouse_report(HID_INSTANCE_MOUSE, 0, buttons, 0, 0, wheel, 0);
+    return tud_hid_n_mouse_report(badusb_manager_mouse_interface(), 0, buttons, 0, 0, wheel, 0);
+}
+
+bool badusb_hid_mouse_buttons_send(uint8_t buttons) {
+    if (!s_active) return false;
+
+    uint8_t mouse_interface = badusb_manager_mouse_interface();
+    uint32_t waited_ms = 0;
+    while (!tud_hid_n_ready(mouse_interface) && !s_stop_requested && waited_ms < 250) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+        waited_ms++;
+    }
+    if (!tud_hid_n_ready(mouse_interface) || s_stop_requested) {
+        return false;
+    }
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (tud_hid_n_mouse_report(mouse_interface, 0, buttons, 0, 0, 0, 0)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+        if (s_stop_requested) {
+            return false;
+        }
+    }
+
+    return false;
 }
 
 static void badusb_send_mouse_delta_chunked(int dx, int dy, uint8_t buttons) {
@@ -779,9 +822,10 @@ static void badusb_exec_task(void *arg) {
     exec_task_params_t *params = (exec_task_params_t *)arg;
 
     s_stop_requested = false;
-    // Keep a stable composite HID identity for clicker runs; the clicker only
-    // needs the mouse interface from the shared descriptor.
-    s_usb_mode = BADUSB_USB_MODE_KEYBOARD;
+    // Clicker mode should enumerate as mouse-first so the host sees a matching
+    // HID identity for the mouse reports we are about to send.
+    s_usb_mode = (params && params->clicker) ? BADUSB_USB_MODE_MOUSE
+                                             : BADUSB_USB_MODE_KEYBOARD;
 
     // If VSENSE is available, wait for USB cable to be plugged in BEFORE
     // installing TinyUSB.  The ESP32-S3 internal PHY needs VBUS present for
@@ -809,22 +853,24 @@ static void badusb_exec_task(void *arg) {
         }
     }
 
-    // Now install TinyUSB and wait for host enumeration
-    esp_err_t ret = badusb_manager_start();
-    if (ret != ESP_OK) {
-        glog("BadUSB: Failed to start: %s\n", esp_err_to_name(ret));
-        badusb_cleanup_task(params);
-        return;
-    }
-
-    glog("BadUSB: USB ready, mounted=%d\n", tud_mounted() ? 1 : 0);
-
     int lines = 0;
 
     if (params->clicker) {
         glog("BadUSB: Running super clicker\n");
         vTaskDelay(pdMS_TO_TICKS(150));
-        if (!click_high_speed_start(ITF_NUM_HID_MOUSE, MOUSE_BUTTON_LEFT, &s_stop_requested)) {
+        if (s_driver_installed) {
+            glog("BadUSB: Restarting USB in mouse mode\n");
+            badusb_uninstall_driver();
+            s_active = false;
+        }
+        esp_err_t ret = badusb_manager_start();
+        if (ret != ESP_OK) {
+            glog("BadUSB: Failed to start mouse HID for clicker: %s\n", esp_err_to_name(ret));
+            badusb_cleanup_task(params);
+            return;
+        }
+        glog("BadUSB: Mouse HID ready, mounted=%d\n", tud_mounted() ? 1 : 0);
+        if (!click_high_speed_start(&s_stop_requested)) {
             glog("BadUSB: Failed to start super clicker payload\n");
             badusb_cleanup_task(params);
             return;
@@ -838,6 +884,16 @@ static void badusb_exec_task(void *arg) {
             glog("BadUSB: Super clicker ended\n");
         }
     } else if (params->from_file) {
+        // Now install TinyUSB and wait for host enumeration for standard BadUSB scripts
+        esp_err_t ret = badusb_manager_start();
+        if (ret != ESP_OK) {
+            glog("BadUSB: Failed to start: %s\n", esp_err_to_name(ret));
+            badusb_cleanup_task(params);
+            return;
+        }
+
+        glog("BadUSB: USB ready, mounted=%d\n", tud_mounted() ? 1 : 0);
+
         FILE *f = fopen(params->path, "r");
         if (!f) {
             glog("BadUSB: Failed to open script: %s\n", params->path);
@@ -847,6 +903,16 @@ static void badusb_exec_task(void *arg) {
             fclose(f);
         }
     } else {
+        // Now install TinyUSB and wait for host enumeration for standard BadUSB scripts
+        esp_err_t ret = badusb_manager_start();
+        if (ret != ESP_OK) {
+            glog("BadUSB: Failed to start: %s\n", esp_err_to_name(ret));
+            badusb_cleanup_task(params);
+            return;
+        }
+
+        glog("BadUSB: USB ready, mounted=%d\n", tud_mounted() ? 1 : 0);
+
         params->buf[params->buf_len] = '\0';
         glog("BadUSB: Executing remote script (%zu bytes)\n", params->buf_len);
         lines = hid_script_execute(params->buf, &usb_transport);

@@ -31,6 +31,8 @@ void badusb_manager_register_stream_handler(void);
 // wheel is the vertical wheel delta in 8-bit signed units; 0 leaves wheel alone)
 bool badusb_hid_mouse_send(int8_t dx, int8_t dy, uint8_t buttons);
 bool badusb_hid_mouse_wheel_send(int8_t wheel, uint8_t buttons);
+bool badusb_hid_mouse_buttons_send(uint8_t buttons);
+uint8_t badusb_manager_mouse_interface(void);
 
 // Mouse jiggler: moves mouse periodically to keep PC awake
 esp_err_t badusb_manager_mouse_jiggle_start(void);
