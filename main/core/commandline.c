@@ -293,6 +293,16 @@ CommandFunction find_command(const char *name) {
     }
     return NULL;
 }
+
+const char *command_name_at(size_t index) {
+    Command *current = command_list_head;
+    while (current != NULL && index > 0) {
+        current = current->next;
+        index--;
+    }
+    return current ? current->name : NULL;
+}
+
 // settings registry to avoid ridiculously long strcmp chains, fuck that lmaooo.
 typedef enum {
     ST_I32,
@@ -3948,15 +3958,6 @@ void handle_help(int argc, char **argv) {
         }
         return;
     }
-
-const char *command_name_at(size_t index) {
-    Command *current = command_list_head;
-    while (current != NULL && index > 0) {
-        current = current->next;
-        index--;
-    }
-    return current ? current->name : NULL;
-}
 
 
     if (strcmp(category, "wifi") == 0) {
