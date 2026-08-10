@@ -293,9 +293,9 @@ void settings_set_defaults(FSettings *settings) {
 #endif
 #if defined(CONFIG_HAS_BADUSB) || defined(CONFIG_HAS_BADUSB_REMOTE)
   settings->badusb_vid = 0x1209;
-  settings->badusb_pid = 0x0001;
+  settings->badusb_pid = 0x0002;
   strcpy(settings->badusb_manufacturer, "USB Device");
-  strcpy(settings->badusb_product, "HID Keyboard");
+  strcpy(settings->badusb_product, "HID Keyboard Mouse");
   settings->badusb_randomize = false;
   settings->badusb_kb_layout = KB_LAYOUT_US;
 #endif
@@ -2109,9 +2109,9 @@ uint8_t settings_get_badusb_kb_layout(const FSettings *settings) {
 
 void settings_reset_badusb_defaults(FSettings *settings) {
   settings->badusb_vid = 0x1209;
-  settings->badusb_pid = 0x0001;
+  settings->badusb_pid = 0x0002;
   strcpy(settings->badusb_manufacturer, "USB Device");
-  strcpy(settings->badusb_product, "HID Keyboard");
+  strcpy(settings->badusb_product, "HID Keyboard Mouse");
   settings->badusb_randomize = false;
   settings->badusb_kb_layout = KB_LAYOUT_US;
 }

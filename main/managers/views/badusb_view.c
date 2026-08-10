@@ -42,6 +42,7 @@ static bool badusb_sd_begin(bool *display_was_suspended)
     return sd_card_jit_begin(display_was_suspended, false);
 }
 
+
 static void badusb_sd_end(bool display_was_suspended)
 {
     sd_card_jit_end(display_was_suspended);
@@ -57,6 +58,7 @@ static BadUsbMenuState current_menu_state = BADUSB_MENU_MAIN;
 
 static const char *badusb_main_options[] = {
     "Run Script",
+    "Super Clicker",
     "USB Keyboard",
     "Mouse Jiggler",
     "Trackpad",
@@ -440,6 +442,38 @@ static void show_running_popup(const char *script_name) {
     show_running_popup_ex(script_name, false);
 }
 
+#ifdef CONFIG_HAS_BADUSB_REMOTE
+static void badusb_send_settings_to_peer(void);
+#endif
+
+static void start_super_clicker(void) {
+    bool remote = badusb_is_remote();
+
+    if (remote) {
+#ifdef CONFIG_HAS_BADUSB_REMOTE
+        if (!esp_comm_manager_is_connected()) {
+            error_popup_create("Not connected to peer");
+            return;
+        }
+        badusb_send_settings_to_peer();
+        if (!esp_comm_manager_send_command("badusb", "clicker")) {
+            error_popup_create("Failed to start clicker");
+            return;
+        }
+        show_running_popup("Super Clicker");
+#endif
+    } else {
+#ifdef CONFIG_HAS_BADUSB
+        esp_err_t ret = badusb_manager_start_clicker();
+        if (ret != ESP_OK) {
+            error_popup_create("Failed to start clicker");
+            return;
+        }
+        show_running_popup("Super Clicker");
+#endif
+    }
+}
+
 // Update the popup in-place when receiving status from S3 (remote) or VSENSE poll (standalone)
 static void badusb_popup_set_running(void) {
     if (!badusb_running_popup || !lv_obj_is_valid(badusb_running_popup)) return;
@@ -682,6 +716,8 @@ static void handle_option(const char *option) {
             }
             current_menu_state = BADUSB_MENU_SCRIPT_SELECT;
             rebuild_menu();
+        } else if (strcmp(option, "Super Clicker") == 0) {
+            start_super_clicker();
         } else if (strcmp(option, "USB Keyboard") == 0) {
             if (remote && !esp_comm_manager_is_connected()) {
                 error_popup_create("Not connected to peer");

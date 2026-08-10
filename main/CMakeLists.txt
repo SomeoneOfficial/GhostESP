@@ -169,6 +169,7 @@ endif()
 if(CONFIG_HAS_BADUSB)
     list(APPEND sources "${CMAKE_SOURCE_DIR}/main/managers/badusb_manager.c")
     list(APPEND sources "${CMAKE_SOURCE_DIR}/main/managers/hid_script_parser.c")
+    list(APPEND sources "${CMAKE_SOURCE_DIR}/main/managers/payloads/click_high_speed.c")
     list(APPEND required_components esp_tinyusb)
 endif()
 

@@ -32,6 +32,7 @@ static const char *TAG = "trackpad_view";
 static View *s_return_view = NULL;
 static lv_obj_t *s_root = NULL;
 static lv_obj_t *s_pad = NULL;
+static lv_obj_t *s_title_label = NULL;
 static lv_obj_t *s_hint_label = NULL;
 static lv_obj_t *s_stop_btn = NULL;
 
@@ -63,13 +64,15 @@ static int s_tp_last_y = 0;
 #endif
 
 // --- Direction key acceleration ---
-// Track when a direction key was first pressed so we can ramp the step size
-// as the global repeat fires.
-static uint8_t s_dir_key_held = 0;     // current direction key being held
-static int64_t s_dir_key_start_us = 0; // when it was first pressed
+// Track motion start so both keyboard and joystick can ramp cleanly.
+static uint8_t s_motion_sources = 0;
+static int64_t s_motion_start_us = 0;
 #define DIR_ACCEL_MIN_STEP   4
 #define DIR_ACCEL_MAX_STEP  32
 #define DIR_ACCEL_FULL_MS  800          // reach max speed after this many ms
+
+#define MOTION_SOURCE_KEYBOARD 0x01
+#define MOTION_SOURCE_JOYSTICK  0x02
 
 // --- Joystick held-direction ---
 static int s_joy_held_mask = 0;
@@ -126,6 +129,17 @@ static void trackpad_apply_move(int dx, int dy) {
     }
 }
 
+static void trackpad_motion_begin(uint8_t source) {
+    if (s_motion_sources == 0) {
+        s_motion_start_us = esp_timer_get_time();
+    }
+    s_motion_sources |= source;
+}
+
+static void trackpad_motion_end(uint8_t source) {
+    s_motion_sources &= (uint8_t)~source;
+}
+
 static void trackpad_apply_button(uint8_t mask) {
     if (trackpad_is_remote()) {
         trackpad_send_remote_button(mask);
@@ -164,6 +178,7 @@ static void click_end_hold(void) {
     s_click = CK_IDLE;
 }
 
+#ifdef CONFIG_USE_TOUCHSCREEN
 static void click_cancel(void) {
     // Moved or unrelated key: no click
     s_click = CK_IDLE;
@@ -171,6 +186,7 @@ static void click_cancel(void) {
         esp_timer_stop(s_click_timer);
     }
 }
+#endif
 
 static void click_timer_cb(void *arg) {
     (void)arg;
@@ -191,7 +207,7 @@ static bool click_is_active(void) {
 static void trackpad_stop_and_exit(void) {
     trackpad_apply_button(0);
     s_joy_held_mask = 0;
-    s_dir_key_held = 0;
+    s_motion_sources = 0;
     s_click = CK_IDLE;
     if (trackpad_is_remote()) {
         esp_comm_manager_send_command("badusb", "trackpad_stop");
@@ -205,8 +221,8 @@ static void trackpad_stop_and_exit(void) {
 }
 
 static int trackpad_accel_step(void) {
-    if (!s_dir_key_held) return DIR_ACCEL_MIN_STEP;
-    int64_t held_ms = (esp_timer_get_time() - s_dir_key_start_us) / 1000;
+    if (!s_motion_sources) return DIR_ACCEL_MIN_STEP;
+    int64_t held_ms = (esp_timer_get_time() - s_motion_start_us) / 1000;
     if (held_ms <= 0) return DIR_ACCEL_MIN_STEP;
     if (held_ms >= DIR_ACCEL_FULL_MS) return DIR_ACCEL_MAX_STEP;
     int range = DIR_ACCEL_MAX_STEP - DIR_ACCEL_MIN_STEP;
@@ -247,10 +263,8 @@ void trackpad_view_create(void) {
     lv_color_t bg = lv_color_hex(theme_palette_get_background(theme));
     lv_color_t surface = lv_color_hex(theme_palette_get_surface(theme));
     lv_color_t accent = lv_color_hex(theme_palette_get_accent(theme));
-    lv_color_t text = lv_color_hex(theme_palette_get_text(theme));
     bool bright = theme_palette_is_bright(theme);
     lv_color_t muted = lv_color_hex(theme_palette_get_surface_alt(theme));
-    lv_color_t pad_grid = bright ? lv_color_hex(0xCCCCCC) : lv_color_hex(0x404040);
 
     // Trackpad surface
     int bar_h = 28;
@@ -260,13 +274,24 @@ void trackpad_view_create(void) {
     lv_obj_align(s_pad, LV_ALIGN_TOP_MID, 0, GUI_STATUS_BAR_H);
     lv_obj_set_style_bg_color(s_pad, bg, 0);
     lv_obj_set_style_bg_opa(s_pad, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(s_pad, pad_grid, 0);
-    lv_obj_set_style_border_width(s_pad, 1, 0);
-    lv_obj_set_style_radius(s_pad, 0, 0);
+    lv_obj_set_style_border_color(s_pad, accent, 0);
+    lv_obj_set_style_border_width(s_pad, 2, 0);
+    lv_obj_set_style_border_opa(s_pad, LV_OPA_70, 0);
+    lv_obj_set_style_radius(s_pad, 14, 0);
+    lv_obj_set_style_shadow_width(s_pad, 14, 0);
+    lv_obj_set_style_shadow_color(s_pad, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(s_pad, LV_OPA_20, 0);
+    lv_obj_set_style_shadow_ofs_y(s_pad, 4, 0);
     lv_obj_clear_flag(s_pad, LV_OBJ_FLAG_SCROLLABLE);
 #ifdef CONFIG_USE_TOUCHSCREEN
     lv_obj_add_flag(s_pad, LV_OBJ_FLAG_CLICKABLE);
 #endif
+
+    s_title_label = lv_label_create(s_pad);
+    lv_label_set_text(s_title_label, "Trackpad");
+    lv_obj_set_style_text_color(s_title_label, accent, 0);
+    lv_obj_set_style_text_font(s_title_label, accessibility_get_font_small(), 0);
+    lv_obj_align(s_title_label, LV_ALIGN_TOP_MID, 0, 8);
 
     s_hint_label = lv_label_create(s_pad);
 #ifdef CONFIG_USE_HW_KB
@@ -278,7 +303,7 @@ void trackpad_view_create(void) {
     lv_obj_set_style_text_color(s_hint_label, muted, 0);
     lv_obj_set_style_text_font(s_hint_label, accessibility_get_font_small(), 0);
     lv_obj_set_style_text_align(s_hint_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(s_hint_label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(s_hint_label, LV_ALIGN_TOP_MID, 0, 28);
 
     // Bottom bar — minimal
     lv_obj_t *bar = lv_obj_create(s_root);
@@ -287,20 +312,22 @@ void trackpad_view_create(void) {
     lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(bar, surface, 0);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(bar, 12, 0);
+    lv_obj_set_style_pad_all(bar, 4, 0);
     lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
     s_stop_btn = lv_btn_create(bar);
     gui_apply_pressed_style(s_stop_btn);
-    lv_obj_set_size(s_stop_btn, 50, 22);
+    lv_obj_set_size(s_stop_btn, 64, 24);
     lv_obj_set_style_bg_color(s_stop_btn, accent, LV_PART_MAIN);
-    lv_obj_set_style_radius(s_stop_btn, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_stop_btn, 12, LV_PART_MAIN);
     lv_obj_set_style_border_width(s_stop_btn, 0, LV_PART_MAIN);
     lv_obj_set_style_shadow_width(s_stop_btn, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(s_stop_btn, 0, LV_PART_MAIN);
     lv_obj_t *lbl_s = lv_label_create(s_stop_btn);
-    lv_label_set_text(lbl_s, LV_SYMBOL_CLOSE);
+    lv_label_set_text(lbl_s, "Stop");
     lv_obj_set_style_text_color(lbl_s, bright ? lv_color_hex(0x000000) : lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_text_font(lbl_s, accessibility_get_font_small(), 0);
     lv_obj_center(lbl_s);
@@ -321,7 +348,7 @@ void trackpad_view_create(void) {
 void trackpad_view_destroy(void) {
     trackpad_apply_button(0);
     s_joy_held_mask = 0;
-    s_dir_key_held = 0;
+    s_motion_sources = 0;
     s_click = CK_IDLE;
     if (s_click_timer) {
         if (esp_timer_is_active(s_click_timer)) esp_timer_stop(s_click_timer);
@@ -330,6 +357,7 @@ void trackpad_view_destroy(void) {
     }
     lvgl_obj_del_safe(&s_root);
     s_root = NULL;
+    s_title_label = NULL;
     s_pad = NULL;
     s_hint_label = NULL;
     s_stop_btn = NULL;
@@ -421,6 +449,9 @@ static void trackpad_input_cb(InputEvent *event) {
             case 4: s_joy_held_mask &= ~(1 << 3); break;
             default: break;
             }
+            if (s_joy_held_mask == 0) {
+                trackpad_motion_end(MOTION_SOURCE_JOYSTICK);
+            }
             return;
         }
 
@@ -428,25 +459,33 @@ static void trackpad_input_cb(InputEvent *event) {
         int jstep;
         switch (button) {
         case 0:
-            if (!(s_joy_held_mask & (1 << 0))) { s_dir_key_start_us = esp_timer_get_time(); s_dir_key_held = 0; }
+            if (!(s_joy_held_mask & (1 << 0))) {
+                if (s_joy_held_mask == 0) trackpad_motion_begin(MOTION_SOURCE_JOYSTICK);
+            }
             s_joy_held_mask |= (1 << 0);
             jstep = trackpad_accel_step();
             trackpad_apply_move(-jstep, 0);
             break;
         case 3:
-            if (!(s_joy_held_mask & (1 << 1))) { s_dir_key_start_us = esp_timer_get_time(); s_dir_key_held = 0; }
+            if (!(s_joy_held_mask & (1 << 1))) {
+                if (s_joy_held_mask == 0) trackpad_motion_begin(MOTION_SOURCE_JOYSTICK);
+            }
             s_joy_held_mask |= (1 << 1);
             jstep = trackpad_accel_step();
             trackpad_apply_move(+jstep, 0);
             break;
         case 2:
-            if (!(s_joy_held_mask & (1 << 2))) { s_dir_key_start_us = esp_timer_get_time(); s_dir_key_held = 0; }
+            if (!(s_joy_held_mask & (1 << 2))) {
+                if (s_joy_held_mask == 0) trackpad_motion_begin(MOTION_SOURCE_JOYSTICK);
+            }
             s_joy_held_mask |= (1 << 2);
             jstep = trackpad_accel_step();
             trackpad_apply_move(0, -jstep);
             break;
         case 4:
-            if (!(s_joy_held_mask & (1 << 3))) { s_dir_key_start_us = esp_timer_get_time(); s_dir_key_held = 0; }
+            if (!(s_joy_held_mask & (1 << 3))) {
+                if (s_joy_held_mask == 0) trackpad_motion_begin(MOTION_SOURCE_JOYSTICK);
+            }
             s_joy_held_mask |= (1 << 3);
             jstep = trackpad_accel_step();
             trackpad_apply_move(0, +jstep);
@@ -470,7 +509,7 @@ static void trackpad_input_cb(InputEvent *event) {
             if (is_click_key(k) && s_click == CK_WAITING) {
                 click_end_tap();   // released before hold threshold → left click
             }
-            s_dir_key_held = 0;
+            trackpad_motion_end(MOTION_SOURCE_KEYBOARD);
             return;
         }
 
@@ -478,13 +517,12 @@ static void trackpad_input_cb(InputEvent *event) {
         is_dir = trackpad_key_to_delta(k, &dx, &dy);
         if (is_dir) {
             if (!event->is_repeat) {
-                s_dir_key_held = k;
-                s_dir_key_start_us = esp_timer_get_time();
+                trackpad_motion_begin(MOTION_SOURCE_KEYBOARD);
             }
             trackpad_apply_move(dx, dy);
             return;
         }
-        s_dir_key_held = 0;
+        trackpad_motion_end(MOTION_SOURCE_KEYBOARD);
 
         // Left/Right click: Enter, Space, or 'd'
         // Fresh press starts tap/hold. Hold → right click. Release before hold → left click.

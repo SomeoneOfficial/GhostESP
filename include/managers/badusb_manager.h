@@ -10,6 +10,7 @@ esp_err_t badusb_manager_start(void);
 esp_err_t badusb_manager_stop(void);
 esp_err_t badusb_manager_execute_file(const char *path);
 esp_err_t badusb_manager_execute_buffer(char *buf, size_t len);
+esp_err_t badusb_manager_start_clicker(void);
 bool badusb_manager_is_active(void);
 int badusb_manager_list_scripts(char scripts[][64], int max_scripts);
 
@@ -30,6 +31,8 @@ void badusb_manager_register_stream_handler(void);
 // wheel is the vertical wheel delta in 8-bit signed units; 0 leaves wheel alone)
 bool badusb_hid_mouse_send(int8_t dx, int8_t dy, uint8_t buttons);
 bool badusb_hid_mouse_wheel_send(int8_t wheel, uint8_t buttons);
+bool badusb_hid_mouse_buttons_send(uint8_t buttons);
+uint8_t badusb_manager_mouse_interface(void);
 
 // Mouse jiggler: moves mouse periodically to keep PC awake
 esp_err_t badusb_manager_mouse_jiggle_start(void);

@@ -850,11 +850,16 @@ void app_main(void) {
             comm_tx == 6 && comm_rx == 7) {
             comm_tx = 11;
             comm_rx = 12;
+        } else if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "OrcaZero") == 0 &&
+                   comm_tx == 6 && comm_rx == 7) {
+            comm_tx = 19;
+            comm_rx = 3;
         } else if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "Pancake") == 0 ||
                    strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "MarauderV8") == 0) {
             comm_tx = UART_PIN_NO_CHANGE;
             comm_rx = UART_PIN_NO_CHANGE;
         }
+
 #endif
         if (comm_tx != UART_PIN_NO_CHANGE || comm_rx != UART_PIN_NO_CHANGE) {
             MEASURE_INIT_RAM("Comm Manager", esp_comm_manager_init((gpio_num_t)comm_tx, (gpio_num_t)comm_rx, DEFAULT_BAUD_RATE));
@@ -907,7 +912,26 @@ void app_main(void) {
 #ifdef CONFIG_WITH_SCREEN
 
 #ifdef CONFIG_USE_JOYSTICK
-#ifdef CONFIG_USE_IO_EXPANDER
+#ifdef CONFIG_USE_ANALOG_JOYSTICK
+    // Analog joystick mode maps two ADC axes to the existing directional inputs.
+#ifdef CONFIG_ANALOG_JOYSTICK_INVERT_X
+    bool invert_x = true;
+#else
+    bool invert_x = false;
+#endif
+#ifdef CONFIG_ANALOG_JOYSTICK_INVERT_Y
+    bool invert_y = true;
+#else
+    bool invert_y = false;
+#endif
+
+    joystick_init_analog(&joysticks[0], CONFIG_ANALOG_JOYSTICK_X_PIN, !invert_x, HOLD_LIMIT);  // Left
+    joystick_init_analog(&joysticks[3], CONFIG_ANALOG_JOYSTICK_X_PIN, invert_x, HOLD_LIMIT);   // Right
+    joystick_init_analog(&joysticks[2], CONFIG_ANALOG_JOYSTICK_Y_PIN, !invert_y, HOLD_LIMIT);  // Up
+    joystick_init_analog(&joysticks[4], CONFIG_ANALOG_JOYSTICK_Y_PIN, invert_y, HOLD_LIMIT);   // Down
+    joystick_init(&joysticks[1], CONFIG_C_BTN, HOLD_LIMIT, true);  // Select
+    printf("Analog joystick setup successfully...\n");
+#elif defined(CONFIG_USE_IO_EXPANDER)
     esp_err_t io_ret;
     MEASURE_INIT_RAM("Joystick IO Expander init", io_ret = joystick_io_expander_init());
     if (io_ret == ESP_OK) {
@@ -1145,3 +1169,4 @@ void app_main(void) {
     printf("\n");
     printf("Type 'help' for available commands\n");
 }
+
