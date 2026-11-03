@@ -21,6 +21,11 @@ typedef struct dns_server_handle *dns_server_handle_t;
 typedef struct {
   uint8_t station_mac[6]; // MAC address of the station (client)
   uint8_t ap_bssid[6];    // BSSID (MAC address) of the access point
+  /* Security type of the AP this station was seen on, as a wifi_auth_mode_t.
+   * Filled in when the station is selected, by looking the parent BSSID up in
+   * the AP scan results. Left as WIFI_AUTH_UNKNOWN when the AP was not in the
+   * scan, which is why callers must treat it as advisory. */
+  uint8_t ap_authmode;
 } station_ap_pair_t;
 
 extern station_ap_pair_t station_ap_list[MAX_STATIONS];
@@ -171,6 +176,12 @@ void wifi_manager_set_manual_disconnect(bool disconnect);
 
 void wifi_manager_configure_sta_from_settings(void);
 
+void wifi_manager_start_sntp(void);
+
+// Returns true once the system clock is valid for HTTPS, waiting for SNTP
+// when necessary.
+bool wifi_manager_wait_for_valid_time(uint32_t timeout_ms);
+
 void wifi_manager_start_ip_lookup();
 
 #ifdef CONFIG_SPIRAM
@@ -310,6 +321,21 @@ void wifi_manager_start_channel_switch_attack(void);
 void wifi_manager_stop_channel_switch_attack(void);
 bool wifi_manager_is_channel_switch_attack_running(void);
 
+// Probe Request Flood Attack
+void wifi_manager_start_probe_flood(void);
+void wifi_manager_stop_probe_flood(void);
+bool wifi_manager_is_probe_flood_running(void);
+
+// Bad Msg Attack (EAPOL key install + zero MIC)
+void wifi_manager_start_bad_msg(void);
+void wifi_manager_stop_bad_msg(void);
+bool wifi_manager_is_bad_msg_running(void);
+
+// Auth Flood Attack
+void wifi_manager_start_auth_flood(void);
+void wifi_manager_stop_auth_flood(void);
+bool wifi_manager_is_auth_flood_running(void);
+
 // Handshake + Deauth combined attack
 void wifi_manager_start_handshake_deauth(void);
 bool wifi_manager_stop_handshake_deauth(void);
@@ -333,10 +359,19 @@ void wifi_manager_track_ap(void);
 void wifi_manager_track_sta(void);
 void wifi_manager_stop_tracking(void);
 
+// Track an arbitrary BSSID directly, with no ap_scan entry required -- used to
+// track surveillance-camera/sniffer hits found by promiscuous scanning. The
+// label is only shown; channel is the channel to sit on while tracking.
+void wifi_manager_track_bssid(const uint8_t bssid[6], uint8_t channel, const char *label);
+
 // Reports the latest tracking RSSI for the live RSSI meter view. Returns false
 // when neither AP nor STA tracking is active. When active, *out_rssi receives the
 // most recent matched RSSI and *out_fresh whether a packet arrived recently.
 bool wifi_manager_get_track_status(int8_t *out_rssi, bool *out_fresh);
+
+// Closeness of the smoothed tracking RSSI within this session's observed
+// [min, max] range, 0-100. Returns -1 when not tracking or no range yet.
+int wifi_manager_get_track_closeness(void);
 
 dns_server_handle_t dns_handle_take(void);
 

@@ -1,4 +1,5 @@
 #include "managers/infrared_manager.h"
+#include "managers/settings_manager.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,22 +37,51 @@ static uint32_t s_poltergeist_io24_hold_refcount = 0;
 /* optional hook provided by infrared_view.c to pause RX while TX allocates a channel */
 __attribute__((weak)) void infrared_rx_pause_for_tx(bool pause) { (void)pause; }
 
+// Effective IR TX pin, resolved once per boot so a settings change can never
+// retarget an already-created RMT channel mid-session.
+#ifdef CONFIG_HAS_INFRARED
+static gpio_num_t s_ir_tx_pin_resolved = GPIO_NUM_NC;
+#endif
+
+gpio_num_t infrared_get_tx_pin(void) {
+#ifdef CONFIG_HAS_INFRARED
+    if (s_ir_tx_pin_resolved == GPIO_NUM_NC) {
+        int32_t override_pin = settings_get_ir_tx_pin(&G_Settings);
+        s_ir_tx_pin_resolved = (gpio_num_t)(override_pin >= 0 ? override_pin : CONFIG_INFRARED_LED_PIN);
+        ESP_LOGI(TAG_IR_MANAGER, "IR TX pin: GPIO%d (%s)", (int)s_ir_tx_pin_resolved,
+                 override_pin >= 0 ? "override" : "default");
+    }
+    return s_ir_tx_pin_resolved;
+#else
+    return GPIO_NUM_NC;
+#endif
+}
+
+gpio_num_t infrared_get_rx_pin(void) {
+#ifdef CONFIG_HAS_INFRARED_RX
+    int32_t override_pin = settings_get_ir_rx_pin(&G_Settings);
+    return (gpio_num_t)(override_pin >= 0 ? override_pin : CONFIG_INFRARED_RX_PIN);
+#else
+    return GPIO_NUM_NC;
+#endif
+}
+
 bool infrared_manager_init(void) {
     bool ok = sd_card_manager.is_initialized;
 #ifdef CONFIG_HAS_INFRARED
     if (ok && CONFIG_HAS_INFRARED) {
-        gpio_reset_pin(CONFIG_INFRARED_LED_PIN);
-        gpio_set_direction(CONFIG_INFRARED_LED_PIN, GPIO_MODE_OUTPUT);
-        gpio_set_level(CONFIG_INFRARED_LED_PIN, 0);
-        ESP_LOGI(TAG_IR_MANAGER, "IR LED pin initialized: %d", CONFIG_INFRARED_LED_PIN);
+        gpio_reset_pin(infrared_get_tx_pin());
+        gpio_set_direction(infrared_get_tx_pin(), GPIO_MODE_OUTPUT);
+        gpio_set_level(infrared_get_tx_pin(), 0);
+        ESP_LOGI(TAG_IR_MANAGER, "IR LED pin initialized: %d", infrared_get_tx_pin());
     }
 #endif
 #if defined(CONFIG_BUILD_CONFIG_TEMPLATE) && defined(CONFIG_HAS_INFRARED)
     if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "poltergeist") == 0) {
-        gpio_reset_pin(CONFIG_INFRARED_LED_PIN);
-        gpio_set_direction(CONFIG_INFRARED_LED_PIN, GPIO_MODE_OUTPUT);
-        gpio_set_level(CONFIG_INFRARED_LED_PIN, 0);
-        ESP_LOGI(TAG_IR_MANAGER, "IO%d configured for poltergeist template", CONFIG_INFRARED_LED_PIN);
+        gpio_reset_pin(INFRARED_POLTERGEIST_SELECT_PIN);
+        gpio_set_direction(INFRARED_POLTERGEIST_SELECT_PIN, GPIO_MODE_OUTPUT);
+        gpio_set_level(INFRARED_POLTERGEIST_SELECT_PIN, 0);
+        ESP_LOGI(TAG_IR_MANAGER, "IO%d configured for poltergeist template", INFRARED_POLTERGEIST_SELECT_PIN);
     }
 #endif
     return ok;
@@ -77,7 +107,7 @@ static char *read_file_to_buffer(const char *path) {
     fseek(f, 0, SEEK_SET);
     char *buf = malloc(size + 1);
     if (!buf) {
-        ESP_LOGE(TAG_IR_MANAGER, "failed to allocate buffer for file: %s", path);
+        ESP_LOGE(TAG_IR_MANAGER, "failed to allocate %ld byte buffer for file: %s", size + 1, path);
         fclose(f);
         return NULL;
     }
@@ -472,8 +502,150 @@ static bool parse_ir_file(char *buf, const char *path, infrared_signal_t **signa
     return true;
 }
 
+static void ir_free_partial(infrared_signal_t **list, size_t list_count, infrared_signal_t *current) {
+    free_signal_array(*list, list_count);
+    infrared_manager_free_signal(current);
+}
+
+// Stream-parse a Flipper-style .ir file line by line. Avoids loading the
+// whole file into one contiguous heap block, which fails on boards without
+// PSRAM once internal RAM fragments (e.g. Cardputer).
+static bool parse_ir_file_stream(FILE *f, infrared_signal_t **signals, size_t *count) {    infrared_signal_t *list = NULL;
+    size_t list_count = 0, list_capacity = 0;
+    infrared_signal_t current;
+    bool in_block = false;
+
+    char *linebuf = NULL;
+    size_t linecap = 0;
+
+    while (true) {
+        // Dynamic getline: grow if a single line exceeds the buffer.
+        if (!linebuf) {
+            linecap = 512;
+            linebuf = malloc(linecap);
+            if (!linebuf) {
+                ESP_LOGE(TAG_IR_MANAGER, "ir stream: linebuf %u alloc failed", (unsigned)linecap);
+                ir_free_partial(&list, list_count, &current);
+                return false;
+            }
+        }
+        size_t len = 0;
+        int ch;
+        bool truncated_line = false;
+        while ((ch = fgetc(f)) != EOF && ch != '\n') {
+            if (len + 2 >= linecap) {
+                size_t ncap = linecap * 2;
+                char *nb = realloc(linebuf, ncap);
+                if (!nb) {
+                    ESP_LOGE(TAG_IR_MANAGER, "ir stream: linebuf grow to %u alloc failed", (unsigned)ncap);
+                    free(linebuf);
+                    ir_free_partial(&list, list_count, &current);
+                    return false;
+                }
+                linebuf = nb; linecap = ncap;
+            }
+            linebuf[len++] = (char)ch;
+        }
+        linebuf[len] = '\0';
+        if (ch == EOF && len == 0) break;
+
+        // If we stopped because the buffer filled mid-line, consume the rest
+        // of this physical line but treat what we have as the logical line.
+        if (ch != EOF && ch != '\n' && !truncated_line) truncated_line = false;
+        while (ch != EOF && ch != '\n') { ch = fgetc(f); }
+
+        char *s = linebuf;
+        while (*s && isspace((unsigned char)*s)) s++;
+        if (*s == '\0' || *s == '#') continue;
+        char *colon = strchr(s, ':');
+        if (!colon) continue;
+        *colon = '\0'; char *key = s; char *value = colon + 1;
+        char *end = key + strlen(key) - 1;
+        while (end > key && isspace((unsigned char)*end)) *end-- = '\0';
+        while (*value && isspace((unsigned char)*value)) value++;
+        char *v_end = value + strlen(value) - 1;
+        while (v_end > value && isspace((unsigned char)*v_end)) *v_end-- = '\0';
+
+        if (strcmp(key, "name") == 0) {
+            if (in_block) {
+                if (list_count == list_capacity) {
+                    size_t new_cap = list_capacity ? list_capacity * 2 : 4;
+                    infrared_signal_t *tmp = realloc(list, new_cap * sizeof(infrared_signal_t));
+                    if (!tmp) {
+                        ESP_LOGE(TAG_IR_MANAGER, "ir stream: signal list %u bytes alloc failed", (unsigned)(new_cap * sizeof(infrared_signal_t)));
+                        free(linebuf); ir_free_partial(&list, list_count, &current); return false;
+                    }
+                    list = tmp; list_capacity = new_cap;
+                }
+                list[list_count++] = current;
+            }
+            memset(&current, 0, sizeof(current)); in_block = true;
+            strncpy(current.name, value, sizeof(current.name) - 1);
+            current.name[sizeof(current.name) - 1] = '\0';
+        } else if (in_block && strcmp(key, "type") == 0) {
+            current.is_raw = (strcmp(value, "raw") == 0);
+        } else if (in_block && current.is_raw) {
+            if (strcmp(key, "frequency") == 0) {
+                current.payload.raw.frequency = (uint32_t)strtoul(value, NULL, 10);
+            } else if (strcmp(key, "duty_cycle") == 0) {
+                current.payload.raw.duty_cycle = strtof(value, NULL);
+            } else if (strcmp(key, "data") == 0) {
+                size_t data_count = 0; const char *p2 = value;
+                while (*p2) { while (*p2 && isspace((unsigned char)*p2)) p2++; if (!*p2) break; data_count++; while (*p2 && !isspace((unsigned char)*p2)) p2++; }
+                uint32_t *timings = malloc(sizeof(uint32_t) * data_count);
+                if (!timings) {
+                    ESP_LOGE(TAG_IR_MANAGER, "ir stream: timings %u bytes alloc failed (%u samples)",
+                             (unsigned)(sizeof(uint32_t) * data_count), (unsigned)data_count);
+                    free(linebuf); ir_free_partial(&list, list_count, &current); return false;
+                }
+                size_t idx2 = 0; p2 = value; char *endptr;
+                while (*p2) { while (*p2 && isspace((unsigned char)*p2)) p2++; if (!*p2) break; unsigned long v = strtoul(p2, &endptr, 10); timings[idx2++] = (uint32_t)v; p2 = endptr; }
+                current.payload.raw.timings = timings; current.payload.raw.timings_size = data_count;
+            }
+        } else if (in_block && !current.is_raw) {
+            if (strcmp(key, "protocol") == 0) {
+                strncpy(current.payload.message.protocol, value, sizeof(current.payload.message.protocol) - 1);
+                current.payload.message.protocol[sizeof(current.payload.message.protocol) - 1] = '\0';
+            } else if (strcmp(key, "address") == 0) {
+                uint32_t addr = 0; const char *p2 = value; char *endptr; uint8_t shift = 0;
+                while (*p2) { while (*p2 && isspace((unsigned char)*p2)) p2++; if (!*p2) break; unsigned long b = strtoul(p2, &endptr, 16); addr |= (uint32_t)(b & 0xFF) << shift; shift += 8; p2 = endptr; }
+                current.payload.message.address = addr;
+            } else if (strcmp(key, "command") == 0) {
+                uint32_t cmd = 0; const char *p2 = value; char *endptr; uint8_t shift = 0;
+                while (*p2) { while (*p2 && isspace((unsigned char)*p2)) p2++; if (!*p2) break; unsigned long b = strtoul(p2, &endptr, 16); cmd |= (uint32_t)(b & 0xFF) << shift; shift += 8; p2 = endptr; }
+                current.payload.message.command = cmd;
+            }
+        }
+    }
+    free(linebuf);
+
+    if (in_block) {
+        if (list_count == list_capacity) {
+            size_t new_cap = list_capacity ? list_capacity * 2 : 4;
+            infrared_signal_t *tmp = realloc(list, new_cap * sizeof(infrared_signal_t));
+            if (!tmp) { ir_free_partial(&list, list_count, &current); return false; }
+            list = tmp; list_capacity = new_cap;
+        }
+        list[list_count++] = current;
+    }
+    if (list_count == 0) { ir_free_partial(&list, list_count, &current); return false; }
+    *signals = list; *count = list_count;
+    return true;
+}
+
 // read a JSON file containing an array of IR signal objects
 bool infrared_manager_read_list(const char *path, infrared_signal_t **signals, size_t *count) {
+    // Preferred: stream the Flipper text format without a whole-file buffer.
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        bool ok = parse_ir_file_stream(f, signals, count);
+        fclose(f);
+        if (ok) return true;
+        ESP_LOGW(TAG_IR_MANAGER, "streaming parse found no signals, falling back: %s", path);
+    } else {
+        ESP_LOGW(TAG_IR_MANAGER, "streaming open failed, falling back: %s", path);
+    }
+
     char *buf = read_file_to_buffer(path);
     if (buf) {
         bool ok = parse_ir_file(buf, path, signals, count);
@@ -552,7 +724,7 @@ static bool send_rmt(const uint32_t *timings, size_t count, uint32_t freq, float
         rmt_tx_channel_config_t cfg = {
             .clk_src = RMT_CLK_SRC_DEFAULT,
 #ifdef CONFIG_HAS_INFRARED
-            .gpio_num = CONFIG_INFRARED_LED_PIN,
+            .gpio_num = infrared_get_tx_pin(),
 #else
             .gpio_num = GPIO_NUM_NC,
 #endif
@@ -616,9 +788,9 @@ void infrared_manager_poltergeist_hold_io24_begin(void) {
 #if defined(CONFIG_BUILD_CONFIG_TEMPLATE) && defined(CONFIG_HAS_INFRARED)
     if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "poltergeist") != 0) return;
     if (s_poltergeist_io24_hold_refcount == 0) {
-        gpio_reset_pin(CONFIG_INFRARED_LED_PIN);
-        gpio_set_direction(CONFIG_INFRARED_LED_PIN, GPIO_MODE_OUTPUT);
-        gpio_set_level(CONFIG_INFRARED_LED_PIN, 1);
+        gpio_reset_pin(INFRARED_POLTERGEIST_SELECT_PIN);
+        gpio_set_direction(INFRARED_POLTERGEIST_SELECT_PIN, GPIO_MODE_OUTPUT);
+        gpio_set_level(INFRARED_POLTERGEIST_SELECT_PIN, 1);
         vTaskDelay(pdMS_TO_TICKS(250));
     }
     s_poltergeist_io24_hold_refcount++;
@@ -631,7 +803,7 @@ void infrared_manager_poltergeist_hold_io24_end(void) {
     if (s_poltergeist_io24_hold_refcount == 0) return;
     s_poltergeist_io24_hold_refcount--;
     if (s_poltergeist_io24_hold_refcount == 0) {
-        gpio_set_level(CONFIG_INFRARED_LED_PIN, 0);
+        gpio_set_level(INFRARED_POLTERGEIST_SELECT_PIN, 0);
     }
 #endif
 }
@@ -650,7 +822,7 @@ bool infrared_manager_transmit(const infrared_signal_t *signal) {
 #endif
 
 #ifdef CONFIG_HAS_INFRARED
-    gpio_set_level(CONFIG_INFRARED_LED_PIN, 1);
+    gpio_set_level(infrared_get_tx_pin(), 1);
 #endif
     rgb_manager_set_color(&rgb_manager, -1, 51, 0, 51, false);
     bool ok = false;
@@ -711,7 +883,7 @@ bool infrared_manager_transmit(const infrared_signal_t *signal) {
         }
     }
 #ifdef CONFIG_HAS_INFRARED
-    gpio_set_level(CONFIG_INFRARED_LED_PIN, 0);
+    gpio_set_level(infrared_get_tx_pin(), 0);
 #endif
 #if defined(CONFIG_BUILD_CONFIG_TEMPLATE) && defined(CONFIG_HAS_INFRARED)
     if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "poltergeist") == 0 && poltergeist_local_hold) {
@@ -903,7 +1075,7 @@ bool infrared_manager_dazzler_start(void) {
 
     rmt_tx_channel_config_t cfg = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
-        .gpio_num = CONFIG_INFRARED_LED_PIN,
+        .gpio_num = infrared_get_tx_pin(),
         .mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL,
         .resolution_hz = 1000000,
         .trans_queue_depth = 1,

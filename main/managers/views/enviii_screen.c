@@ -16,7 +16,11 @@
 #include "i2c_bus_lock.h"
 #include "i2c_shared.h"
 #include <math.h>
+#include <string.h>
 #include "gui/design_tokens.h"
+#include "gui/touch_bar.h"
+#include "managers/gps_manager.h"
+#include "vendor/drivers/aw9523.h"
 
 #ifdef CONFIG_HAS_ENVIII
 
@@ -37,6 +41,7 @@ static lv_obj_t *touch_bar = NULL;
 static lv_obj_t *enviii_btn_up = NULL;
 static lv_obj_t *enviii_btn_back = NULL;
 static lv_obj_t *enviii_btn_down = NULL;
+static gui_touch_bar_t s_touch_tb;
 static lv_timer_t *enviii_timer = NULL;
 
 #ifdef CONFIG_USE_TOUCHSCREEN
@@ -49,6 +54,9 @@ static i2c_master_dev_handle_t s_qmp6988_dev = NULL;
 static float sea_level_pressure = 1013.25f;
 static bool sht_data_valid = false;
 static bool qmp_data_valid = false;
+static bool gps_stopped_by_enviii = false;
+static bool enviii_released_i2c_bus = false;
+static int enviii_pin_candidate = -1; /* -1 = board profile pins */
 
 static uint32_t accent_color = 0x00FFFF;
 static uint32_t bg_color = 0x0A0A0A;
@@ -59,18 +67,26 @@ static uint32_t dim_color = 0x888888;
 static void enviii_scroll_content(int dir);
 
 #ifdef CONFIG_USE_TOUCHSCREEN
+/* Geometry aliases: canonical values now live in gui/touch_bar.h
+ * (GUI_TOUCH_BAR_BTN_SIZE / GUI_TOUCH_BAR_PADDING). Height math uses
+ * gui_touch_bar_height() directly. */
 #define ENVIII_SCROLL_BTN_SIZE    28
 #define ENVIII_SCROLL_BTN_PADDING 3
-
-static int enviii_touch_bar_height(void) {
-    return ENVIII_SCROLL_BTN_SIZE + ENVIII_SCROLL_BTN_PADDING * 2;
-}
 #endif
 
 #ifndef CONFIG_ENVIII_I2C_PORT
 #define CONFIG_ENVIII_I2C_PORT 0
 #endif
 #define ENVIII_I2C_PORT CONFIG_ENVIII_I2C_PORT
+
+static bool enviii_has_gps_i2c_conflict(void) {
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+    return strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "m5cores3se") == 0 &&
+           ENVIII_I2C_PORT == 1;
+#else
+    return false;
+#endif
+}
 
 #ifndef CONFIG_I2C_MANAGER_0_SDA
 #define CONFIG_I2C_MANAGER_0_SDA (-1)
@@ -82,14 +98,60 @@ static int enviii_touch_bar_height(void) {
 #define CONFIG_I2C_MANAGER_0_PULLUPS 0
 #endif
 #ifndef CONFIG_I2C_MANAGER_1_SDA
+#ifdef CONFIG_IS_ATOMS3R
+#define CONFIG_I2C_MANAGER_1_SDA 2
+#else
 #define CONFIG_I2C_MANAGER_1_SDA (-1)
 #endif
+#endif
 #ifndef CONFIG_I2C_MANAGER_1_SCL
+#ifdef CONFIG_IS_ATOMS3R
+#define CONFIG_I2C_MANAGER_1_SCL 1
+#else
 #define CONFIG_I2C_MANAGER_1_SCL (-1)
+#endif
 #endif
 #ifndef CONFIG_I2C_MANAGER_1_PULLUPS
 #define CONFIG_I2C_MANAGER_1_PULLUPS 0
 #endif
+
+/* CoreS3-SE DIN-base {SDA, SCL} candidates. The board profile covers PORT.A
+ * (yellow=G2 SDA, white=G1 SCL, confirmed on hardware); units on the other
+ * ports or reversed cables are probed in order below until the sensors
+ * acknowledge. */
+static int enviii_candidate_count(void) {
+    return enviii_has_gps_i2c_conflict() ? 5 : 0;
+}
+
+static void enviii_candidate_pins(int idx, gpio_num_t *sda, gpio_num_t *scl) {
+    static const gpio_num_t pins[][2] = {
+        { GPIO_NUM_1, GPIO_NUM_2 },   /* PORT.A swapped */
+        { GPIO_NUM_8, GPIO_NUM_9 },   /* PORT.B (white=G8, yellow=G9) */
+        { GPIO_NUM_9, GPIO_NUM_8 },   /* PORT.B swapped */
+        { GPIO_NUM_18, GPIO_NUM_17 }, /* PORT.C (white=G18, yellow=G17) */
+        { GPIO_NUM_17, GPIO_NUM_18 }, /* PORT.C swapped */
+    };
+    *sda = pins[idx][0];
+    *scl = pins[idx][1];
+}
+
+static gpio_num_t enviii_i2c_sda(void) {
+    if (enviii_pin_candidate >= 0 && ENVIII_I2C_PORT == 1) {
+        gpio_num_t sda, scl;
+        enviii_candidate_pins(enviii_pin_candidate, &sda, &scl);
+        return sda;
+    }
+    return (gpio_num_t)CONFIG_I2C_MANAGER_1_SDA;
+}
+
+static gpio_num_t enviii_i2c_scl(void) {
+    if (enviii_pin_candidate >= 0 && ENVIII_I2C_PORT == 1) {
+        gpio_num_t sda, scl;
+        enviii_candidate_pins(enviii_pin_candidate, &sda, &scl);
+        return scl;
+    }
+    return (gpio_num_t)CONFIG_I2C_MANAGER_1_SCL;
+}
 
 #ifndef CONFIG_ENVIII_SHT30_I2C_ADDR
 #define CONFIG_ENVIII_SHT30_I2C_ADDR 0x44
@@ -100,6 +162,20 @@ static int enviii_touch_bar_height(void) {
 #define CONFIG_ENVIII_QMP6988_I2C_ADDR 0x70
 #endif
 #define QMP6988_I2C_ADDR CONFIG_ENVIII_QMP6988_I2C_ADDR
+
+static void enviii_scan_and_log_bus(i2c_master_bus_handle_t bus) {
+    char found[128];
+    int pos = 0;
+    found[0] = '\0';
+    for (uint16_t addr = 0x08; addr <= 0x77; addr++) {
+        if (i2c_master_probe(bus, addr, 15) == ESP_OK) {
+            pos += snprintf(found + pos, sizeof(found) - pos, "%s0x%02X",
+                            pos ? " " : "", addr);
+            if (pos >= (int)sizeof(found) - 6) break;
+        }
+    }
+    ESP_LOGI(TAG, "I2C bus scan result: %s", pos ? found : "no devices found");
+}
 
 static esp_err_t enviii_get_bus(i2c_master_bus_handle_t *bus) {
     if (!bus) return ESP_ERR_INVALID_ARG;
@@ -116,8 +192,8 @@ static esp_err_t enviii_get_bus(i2c_master_bus_handle_t *bus) {
         scl = (gpio_num_t)CONFIG_I2C_MANAGER_0_SCL;
         pullups = CONFIG_I2C_MANAGER_0_PULLUPS;
     } else if (ENVIII_I2C_PORT == 1) {
-        sda = (gpio_num_t)CONFIG_I2C_MANAGER_1_SDA;
-        scl = (gpio_num_t)CONFIG_I2C_MANAGER_1_SCL;
+        sda = enviii_i2c_sda();
+        scl = enviii_i2c_scl();
         pullups = CONFIG_I2C_MANAGER_1_PULLUPS;
     }
 
@@ -135,6 +211,7 @@ static esp_err_t enviii_get_bus(i2c_master_bus_handle_t *bus) {
                                        &created);
     if (ret == ESP_OK && created) {
         ESP_LOGI(TAG, "Created ENV-III I2C bus %d (SDA=%d, SCL=%d)", ENVIII_I2C_PORT, sda, scl);
+        enviii_scan_and_log_bus(*bus);
     }
     return ret;
 }
@@ -165,14 +242,7 @@ static esp_err_t sht30_get_device(void) {
         return ret;
     }
 
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = SHT30_I2C_ADDR,
-        .scl_speed_hz = 100000,
-        .scl_wait_us = 0,
-    };
-
-    ret = i2c_master_bus_add_device(bus, &dev_cfg, &s_sht30_dev);
+    ret = i2c_shared_get_device(bus, SHT30_I2C_ADDR, 100000, &s_sht30_dev);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add SHT30 device: %s", esp_err_to_name(ret));
     }
@@ -216,10 +286,12 @@ static bool sht30_initialized = false;
 
 static void sht30_init_hw(void) {
     if (sht30_initialized) return;
-    sht30_write_cmd(0x30A2);  /* soft reset */
+    esp_err_t ret = sht30_write_cmd(0x30A2);  /* soft reset */
     vTaskDelay(pdMS_TO_TICKS(5));
-    sht30_initialized = true;
-    ESP_LOGI(TAG, "SHT30 initialized");
+    sht30_initialized = ret == ESP_OK;
+    if (sht30_initialized) {
+        ESP_LOGI(TAG, "SHT30 initialized");
+    }
 }
 
 static bool sht30_read(float *out_temp, float *out_hum) {
@@ -299,14 +371,7 @@ static esp_err_t qmp6988_get_device(void) {
         return ret;
     }
 
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = QMP6988_I2C_ADDR,
-        .scl_speed_hz = 100000,
-        .scl_wait_us = 0,
-    };
-
-    ret = i2c_master_bus_add_device(bus, &dev_cfg, &s_qmp6988_dev);
+    ret = i2c_shared_get_device(bus, QMP6988_I2C_ADDR, 100000, &s_qmp6988_dev);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add QMP6988 device: %s", esp_err_to_name(ret));
     }
@@ -674,11 +739,8 @@ static void enviii_timer_cb(lv_timer_t *timer) {
 /* -------------------------------------------------------------------------- */
 #ifdef CONFIG_USE_TOUCHSCREEN
 static bool enviii_point_in_obj(const lv_point_t *p, lv_obj_t *obj) {
-    if (!p || !obj || !lv_obj_is_valid(obj)) return false;
-    lv_area_t area;
-    lv_obj_get_coords(obj, &area);
-    return p->x >= area.x1 && p->x <= area.x2 &&
-           p->y >= area.y1 && p->y <= area.y2;
+    if (!p) return false;
+    return gui_touch_bar_hit(obj, p->x, p->y);
 }
 #endif
 
@@ -799,59 +861,18 @@ static lv_obj_t *make_metric_card(lv_obj_t *parent, int width_pct, const char *t
 static void create_touch_control_bar(lv_obj_t *root) {
     if (!root) return;
 
-    const int bar_h = enviii_touch_bar_height();
-
-    touch_bar = lv_obj_create(root);
-    lv_obj_remove_style_all(touch_bar);
-    lv_obj_set_size(touch_bar, LV_HOR_RES, bar_h);
-    lv_obj_align(touch_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(touch_bar, lv_color_hex(bg_color), 0);
-    lv_obj_set_style_bg_opa(touch_bar, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(touch_bar, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-
-    lv_obj_t *scroll_up_btn = lv_btn_create(touch_bar);
-    gui_apply_pressed_style(scroll_up_btn);
-    enviii_btn_up = scroll_up_btn;
-    lv_obj_set_size(scroll_up_btn, ENVIII_SCROLL_BTN_SIZE, ENVIII_SCROLL_BTN_SIZE);
-    lv_obj_align(scroll_up_btn, LV_ALIGN_LEFT_MID, ENVIII_SCROLL_BTN_PADDING, 0);
-    lv_obj_set_style_bg_color(scroll_up_btn, lv_color_hex(card_color), 0);
-    lv_obj_set_style_radius(scroll_up_btn, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(scroll_up_btn, 0, 0);
-    lv_obj_set_style_shadow_width(scroll_up_btn, 0, 0);
-    lv_obj_t *up_label = lv_label_create(scroll_up_btn);
-    lv_label_set_text(up_label, LV_SYMBOL_UP);
-    lv_obj_set_style_text_color(up_label, lv_color_hex(text_color), 0);
-    lv_obj_center(up_label);
-
-    lv_obj_t *back_btn = lv_btn_create(touch_bar);
-    gui_apply_pressed_style(back_btn);
-    enviii_btn_back = back_btn;
-    lv_obj_set_size(back_btn, ENVIII_SCROLL_BTN_SIZE + 24, ENVIII_SCROLL_BTN_SIZE);
-    lv_obj_align(back_btn, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(card_color), 0);
-    lv_obj_set_style_radius(back_btn, 5, 0);
-    lv_obj_set_style_pad_hor(back_btn, 8, 0);
-    lv_obj_set_style_border_width(back_btn, 0, 0);
-    lv_obj_set_style_shadow_width(back_btn, 0, 0);
-    lv_obj_t *back_label = lv_label_create(back_btn);
-    lv_label_set_text(back_label, LV_SYMBOL_LEFT " Back");
-    lv_obj_set_style_text_color(back_label, lv_color_hex(text_color), 0);
-    lv_obj_set_style_text_font(back_label, accessibility_get_font_small(), 0);
-    lv_obj_center(back_label);
-
-    lv_obj_t *scroll_down_btn = lv_btn_create(touch_bar);
-    gui_apply_pressed_style(scroll_down_btn);
-    enviii_btn_down = scroll_down_btn;
-    lv_obj_set_size(scroll_down_btn, ENVIII_SCROLL_BTN_SIZE, ENVIII_SCROLL_BTN_SIZE);
-    lv_obj_align(scroll_down_btn, LV_ALIGN_RIGHT_MID, -ENVIII_SCROLL_BTN_PADDING, 0);
-    lv_obj_set_style_bg_color(scroll_down_btn, lv_color_hex(card_color), 0);
-    lv_obj_set_style_radius(scroll_down_btn, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(scroll_down_btn, 0, 0);
-    lv_obj_set_style_shadow_width(scroll_down_btn, 0, 0);
-    lv_obj_t *down_label = lv_label_create(scroll_down_btn);
-    lv_label_set_text(down_label, LV_SYMBOL_DOWN);
-    lv_obj_set_style_text_color(down_label, lv_color_hex(text_color), 0);
-    lv_obj_center(down_label);
+    s_touch_tb = gui_touch_bar_create(root);
+    touch_bar = s_touch_tb.bar;
+    enviii_btn_up = s_touch_tb.up_btn;
+    enviii_btn_back = s_touch_tb.back_btn;
+    enviii_btn_down = s_touch_tb.down_btn;
+    /* This view keeps the scroll arrows always visible (no overflow gating);
+     * the helper starts them hidden, so un-hide to preserve the original look.
+     * Button dispatch stays manual (enviii_event_handler PR stage). */
+    if (enviii_btn_up && lv_obj_is_valid(enviii_btn_up))
+        lv_obj_clear_flag(enviii_btn_up, LV_OBJ_FLAG_HIDDEN);
+    if (enviii_btn_down && lv_obj_is_valid(enviii_btn_down))
+        lv_obj_clear_flag(enviii_btn_down, LV_OBJ_FLAG_HIDDEN);
 }
 #endif
 
@@ -862,6 +883,17 @@ void enviii_create(void) {
 #ifdef CONFIG_USE_TOUCHSCREEN
     touch_drag_reset(&enviii_touch_drag);
 #endif
+    /* CoreS3-SE routes the default GPS RX pin (GPIO2) over ENV-III's I2C1
+     * SDA line. Stop GPS before taking that bus so UART pin-matrix setup cannot
+     * corrupt sensor transactions. */
+    gps_stopped_by_enviii = false;
+    enviii_released_i2c_bus = false;
+    if (enviii_has_gps_i2c_conflict() && g_gpsManager.isinitilized) {
+        gps_manager_deinit(&g_gpsManager);
+        gps_stopped_by_enviii = true;
+        esp_err_t bus_ret = i2c_shared_release_bus((i2c_port_num_t)ENVIII_I2C_PORT);
+        enviii_released_i2c_bus = bus_ret == ESP_OK || bus_ret == ESP_ERR_NOT_FOUND;
+    }
     refresh_theme_colors();
     display_manager_fill_screen(lv_color_hex(bg_color));
     enviii_container = gui_screen_create_root(NULL, "ENV-III", lv_color_hex(bg_color), LV_OPA_COVER);
@@ -870,7 +902,7 @@ void enviii_create(void) {
     lv_obj_t *content = gui_screen_create_content(enviii_container, GUI_STATUS_BAR_HEIGHT);
     enviii_content = content;
 #ifdef CONFIG_USE_TOUCHSCREEN
-    const int touch_bar_h = enviii_touch_bar_height();
+    const int touch_bar_h = gui_touch_bar_height();
     lv_obj_set_size(content, LV_HOR_RES, LV_VER_RES - GUI_STATUS_BAR_HEIGHT - touch_bar_h);
 #endif
     lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
@@ -948,12 +980,43 @@ void enviii_create(void) {
     last_hum = 0.0f;
     last_press = 0.0f;
 
-    sht30_init_hw();
-    qmp6988_init_hw();
+    sht30_initialized = false;
+    qmp6988_initialized = false;
 
-    enviii_timer = lv_timer_create(enviii_timer_cb, 500, NULL);
-    /* immediate first sample */
-    enviii_timer_cb(enviii_timer);
+    /* On the CoreS3-SE the grove ports' 5V comes from a boost converter gated
+     * by the AW9523 expander (enabled at boot). Re-assert it here so a unit
+     * hot-plugged after boot is powered, and let it settle before probing. */
+    if (aw9523_set_port_5v(true) == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    bool found = false;
+    int attempts = enviii_candidate_count() + 1;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        if (attempt > 0) {
+            s_sht30_dev = NULL;
+            s_qmp6988_dev = NULL;
+            i2c_shared_release_bus((i2c_port_num_t)ENVIII_I2C_PORT);
+            enviii_released_i2c_bus = true;
+            enviii_pin_candidate = attempt - 1;
+            ESP_LOGW(TAG, "No ENV-III response; probing SDA=%d, SCL=%d",
+                     (int)enviii_i2c_sda(), (int)enviii_i2c_scl());
+        }
+        sht30_init_hw();
+        qmp6988_init_hw();
+        if (sht30_initialized || qmp6988_initialized) {
+            found = true;
+            break;
+        }
+    }
+
+    if (found) {
+        enviii_timer = lv_timer_create(enviii_timer_cb, 500, NULL);
+        /* immediate first sample */
+        enviii_timer_cb(enviii_timer);
+    } else {
+        ESP_LOGE(TAG, "ENV-III not found on any CoreS3-SE DIN port (G1/G2, G8/G9, G17/G18)");
+    }
 }
 
 void enviii_destroy(void) {
@@ -961,14 +1024,18 @@ void enviii_destroy(void) {
         lv_timer_del(enviii_timer);
         enviii_timer = NULL;
     }
-    if (s_sht30_dev) {
-        i2c_master_bus_rm_device(s_sht30_dev);
-        s_sht30_dev = NULL;
+    if (enviii_released_i2c_bus) {
+        i2c_shared_release_bus((i2c_port_num_t)ENVIII_I2C_PORT);
+        enviii_released_i2c_bus = false;
     }
-    if (s_qmp6988_dev) {
-        i2c_master_bus_rm_device(s_qmp6988_dev);
-        s_qmp6988_dev = NULL;
+    enviii_pin_candidate = -1;
+    if (gps_stopped_by_enviii) {
+        gps_manager_init(&g_gpsManager);
+        gps_stopped_by_enviii = false;
     }
+    /* Shared I2C device handles remain cached for other Grove apps. */
+    s_sht30_dev = NULL;
+    s_qmp6988_dev = NULL;
     if (enviii_container) {
         lv_obj_del(enviii_container);
         enviii_container = NULL;
@@ -984,6 +1051,7 @@ void enviii_destroy(void) {
     press_hpa_label = NULL;
     press_inhg_label = NULL;
     alt_label = NULL;
+    gui_touch_bar_destroy(&s_touch_tb);
     touch_bar = NULL;
     enviii_btn_up = NULL;
     enviii_btn_back = NULL;

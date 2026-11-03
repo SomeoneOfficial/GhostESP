@@ -13,6 +13,7 @@
 #include "gui/lvgl_safe.h"
 #include "lvgl.h"
 #include "core/esp_comm_manager.h"
+#include "core/utils.h"
 #include "sdkconfig.h"
 #include <string.h>
 #include <stdio.h>
@@ -155,6 +156,13 @@ static eth_disp_poison_t s_poison      = {0};
 static eth_disp_iface_t  s_iface       = {0};
 static eth_workspace_t   s_workspace   = {0};
 static bool              s_scan_running = false;
+
+// Remote-mode acknowledgement tracking: records are only meaningful once the
+// peer echoes "S|scanning". If no echo arrives within a few seconds, the peer
+// likely never received/recognized the command (e.g. outdated peer firmware)
+// -- surface that instead of showing a fake scanning screen forever.
+static bool     s_peer_ack      = false;
+static uint32_t s_no_ack_ticks  = 0;
 
 // ============================================================
 // Static UI state
@@ -510,6 +518,9 @@ static void eth_stream_rx_cb(uint8_t channel, const uint8_t *data, size_t length
         if (strcmp(payload, "scanning") == 0) {
             s_scan_running = true;
             s_scan.done    = false;
+            // Peer acknowledged the scan command; live records are flowing.
+            s_peer_ack     = true;
+            s_no_ack_ticks = 0;
         } else if (strcmp(payload, "done") == 0) {
             s_scan_running = false;
             s_scan.done    = true;
@@ -529,13 +540,12 @@ static void eth_stream_rx_cb(uint8_t channel, const uint8_t *data, size_t length
 static lv_obj_t *create_card(lv_obj_t *parent, int width_pct) {
     lv_obj_t *card = lv_obj_create(parent);
     int padding = LV_VER_RES <= 100 ? 3 : (LV_VER_RES <= 160 ? 5 : 8);
+    lv_coord_t radius = settings_get_menu_rounded(&G_Settings) ? GUI_RADIUS_SM : 0;
     lv_obj_set_size(card, LV_PCT(width_pct), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_color(card, lv_color_hex(card_color), 0);
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(card, lv_color_hex(accent_color), 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_border_side(card, LV_BORDER_SIDE_LEFT, 0);
-    lv_obj_set_style_radius(card, 0, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_radius(card, radius, 0);
     lv_obj_set_style_pad_all(card, padding, 0);
     lv_obj_set_style_text_color(card, lv_color_hex(text_color), 0);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -610,7 +620,10 @@ static void refresh_dashboard_labels(void) {
     lv_label_set_text(s_lbl_ip,   s_iface.ip[0]   ? s_iface.ip   : "--");
     lv_label_set_text(s_lbl_mask, s_iface.mask[0] ? s_iface.mask : "--");
     lv_label_set_text(s_lbl_gw,   s_iface.gw[0]   ? s_iface.gw   : "--");
-    lv_label_set_text(s_lbl_mac,  s_iface.mac[0]  ? s_iface.mac  : "--");
+    char mac_disp[sizeof(s_iface.mac)];
+    snprintf(mac_disp, sizeof(mac_disp), "%s", s_iface.mac);
+    privacy_redact_mac(mac_disp);  /* s_iface.mac stays raw */
+    lv_label_set_text(s_lbl_mac,  s_iface.mac[0]  ? mac_disp : "--");
     if (s_lbl_link) {
         char link_str[32];
         if (s_iface.speed_mbps > 0)
@@ -745,7 +758,7 @@ static void on_poison_monitor(lv_event_t *e) {
 
 static void on_back(lv_event_t *e) {
     (void)e;
-    display_manager_switch_view(s_return_view ? s_return_view : &options_menu_view);
+    display_manager_go_back();
 }
 
 void ethernet_screen_set_return_view(View *view) {
@@ -858,6 +871,14 @@ static void scan_poll_cb(lv_timer_t *t) {
     done = s_scan.done;
     if (!done) {
         if (s_scan_status) {
+            // If the peer never echoed "S|scanning", it did not receive or
+            // recognize the command (outdated peer firmware). After ~3 s,
+            // stop showing fake live progress and say so instead.
+            if (!s_peer_ack && ++s_no_ack_ticks > 15) {
+                scan_status_set_subtext(s_scan_status,
+                    "Peer not responding - check peer firmware/link");
+                return;
+            }
             scan_status_set_progress(s_scan_status, s_scan.progress_current, s_scan.progress_total);
             char sub[48];
             if (s_scan.type == 1)
@@ -865,6 +886,8 @@ static void scan_poll_cb(lv_timer_t *t) {
             else if (s_scan.type == 2 || s_scan.type == 3)
                 snprintf(sub, sizeof(sub), "Port %d/%d, %d open",
                          s_scan.progress_current, s_scan.progress_total, s_scan.port_count);
+            else if (s_scan.type == 0)
+                snprintf(sub, sizeof(sub), "Discovering services...");
             else
                 snprintf(sub, sizeof(sub), "Sweeping...");
             scan_status_set_subtext(s_scan_status, sub);
@@ -959,6 +982,8 @@ static void status_timer_cb(lv_timer_t *t) {
 static void build_dashboard(void) {
     // Compact status card (natural height, first item in the flex column)
     lv_obj_t *status_card = create_card(s_content, 100);
+    lv_obj_set_width(status_card, LV_HOR_RES - 2 * GUI_OPTIONS_LIST_PAD_HOR);
+    lv_obj_set_flex_align(s_content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
     s_lbl_status = add_stat_row(status_card, "Status");
     s_lbl_ip     = add_stat_row(status_card, "IP");
     s_lbl_mask   = add_stat_row(status_card, "Mask");
@@ -975,6 +1000,7 @@ static void build_dashboard(void) {
         // the parent flex-column drive position; flex-grow fills leftover height
         lv_obj_set_align(list, LV_ALIGN_DEFAULT);
         lv_obj_set_flex_grow(list, 1);
+        lv_obj_set_style_pad_top(list, 0, 0);
         lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_scroll_dir(list, LV_DIR_VER);
         lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
@@ -1005,6 +1031,8 @@ static void build_dashboard(void) {
 // ============================================================
 
 static void build_scanning(void) {
+    s_peer_ack     = false;
+    s_no_ack_ticks = 0;
     s_scan_status = scan_status_create("Scanning...");
     scan_status_set_subtext(s_scan_status, "Initializing...");
     s_poll_timer = lv_timer_create(scan_poll_cb, 200, NULL);
@@ -1022,8 +1050,11 @@ static void build_fp_list(void) {
         eth_disp_fp_host_t *h = fp_hosts_list ? &fp_hosts_list[i] : NULL;
         if (!h) break;
         char label[96];
-        if (h->name[0])
-            snprintf(label, sizeof(label), "%s  %s", h->ip_str, h->name);
+        if (h->name[0]) {
+            char name_disp[64];
+            privacy_redact_text_copy(h->name, name_disp, sizeof(name_disp));
+            snprintf(label, sizeof(label), "%s  %s", h->ip_str, name_disp);
+        }
         else if (h->device_type[0])
             snprintf(label, sizeof(label), "%s  [%s]", h->ip_str, h->device_type);
         else
@@ -1050,13 +1081,18 @@ static void build_arp_list(void) {
         eth_disp_host_t *h = arp_hosts_list ? &arp_hosts_list[i] : NULL;
         if (!h) break;
         char label[80];
-        if (h->hostname[0])
-            snprintf(label, sizeof(label), "%s  %s", h->ip_str, h->hostname);
-        else
-            snprintf(label, sizeof(label), "%s  %02X:%02X:%02X:%02X:%02X:%02X",
-                     h->ip_str,
+        if (h->hostname[0]) {
+            char host_disp[48];
+            privacy_redact_text_copy(h->hostname, host_disp, sizeof(host_disp));
+            snprintf(label, sizeof(label), "%s  %s", h->ip_str, host_disp);
+        } else {
+            char mac_str[18];
+            snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
                      h->mac[0], h->mac[1], h->mac[2],
                      h->mac[3], h->mac[4], h->mac[5]);
+            privacy_redact_mac(mac_str);
+            snprintf(label, sizeof(label), "%s  %s", h->ip_str, mac_str);
+        }
         options_view_add_item(s_action_ov, label, on_arp_host_selected, (void *)(intptr_t)i);
     }
     if (s_scan.arp_count == 0)
@@ -1084,11 +1120,19 @@ static void build_fp_results(void) {
     if (!s_result_dv) return;
 
     detail_view_add_info(s_result_dv, "IP", h->ip_str);
-    if (h->name[0])         detail_view_add_info(s_result_dv, "Name",     h->name);
+    if (h->name[0]) {
+        char name_disp[64];
+        privacy_redact_text_copy(h->name, name_disp, sizeof(name_disp));
+        detail_view_add_info(s_result_dv, "Name",     name_disp);
+    }
     if (h->device_type[0])  detail_view_add_info(s_result_dv, "Type",     h->device_type);
     if (h->protocol[0])     detail_view_add_info(s_result_dv, "Protocol", h->protocol);
     if (h->service_type[0]) detail_view_add_info(s_result_dv, "Service",  h->service_type);
-    if (h->os_info[0])      detail_view_add_info(s_result_dv, "OS",       h->os_info);
+    if (h->os_info[0]) {
+        char os_disp[64];
+        privacy_redact_text_copy(h->os_info, os_disp, sizeof(os_disp));
+        detail_view_add_info(s_result_dv, "OS",       os_disp);
+    }
     detail_view_add_back(s_result_dv, on_back_to_fp_list, NULL);
     detail_view_set_selected(s_result_dv, 0);
 }
@@ -1111,9 +1155,14 @@ static void build_arp_results(void) {
     char mac_str[24];
     snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
              h->mac[0], h->mac[1], h->mac[2], h->mac[3], h->mac[4], h->mac[5]);
+    privacy_redact_mac(mac_str);
     detail_view_add_info(s_result_dv, "IP",  h->ip_str);
     detail_view_add_info(s_result_dv, "MAC", mac_str);
-    if (h->hostname[0]) detail_view_add_info(s_result_dv, "Host", h->hostname);
+    if (h->hostname[0]) {
+        char host_disp[48];
+        privacy_redact_text_copy(h->hostname, host_disp, sizeof(host_disp));
+        detail_view_add_info(s_result_dv, "Host", host_disp);
+    }
     detail_view_add_back(s_result_dv, on_back_to_arp_list, NULL);
     detail_view_set_selected(s_result_dv, 0);
 }
@@ -1187,6 +1236,7 @@ static void build_poison_monitor(void) {
     lv_obj_set_style_bg_color(tab_bar, lv_color_hex(card_color), 0);
     lv_obj_set_style_bg_opa(tab_bar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(tab_bar, 0, 0);
+    lv_obj_set_style_radius(tab_bar, settings_get_menu_rounded(&G_Settings) ? GUI_RADIUS_SM : 0, 0);
     lv_obj_set_style_pad_all(tab_bar, 4, 0);
     lv_obj_clear_flag(tab_bar, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(tab_bar, LV_FLEX_FLOW_ROW);
@@ -1548,7 +1598,7 @@ static void ethernet_screen_input_cb(InputEvent *event) {
                             lv_event_send(btn, LV_EVENT_CLICKED, NULL);
                     }
                 }
-                if (back) display_manager_switch_view(s_return_view ? s_return_view : &options_menu_view);
+                if (back) display_manager_go_back();
             }
             break;
 

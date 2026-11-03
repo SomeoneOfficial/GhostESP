@@ -1,13 +1,12 @@
 ---
 title: "GhostScript"
-description: "Write Lua scripts that chain CLI commands, react to events, and automate multi-step workflows on GhostESP."
+description: "Write Lua scripts that chain CLI commands, react to events, and automate multi-step workflows on GhostESP"
 weight: 620
-toc: true
 aliases:
   - "/development/ghostscript/"
 ---
 
-## What is GhostScript?
+## What Is GhostScript?
 
 GhostScript is a tiny Lua 5.4 runtime that runs `.gsb` precompiled Lua chunks from the SD card. Scripts can call existing APIs and CLI commands, read output, subscribe to events, and react to input, letting you chain commands and automate multi-step workflows without flashing new firmware.
 
@@ -67,11 +66,11 @@ script status
 script stop
 ```
 
-`script list` recursively finds standalone `.gsb` files and directories containing a `manifest.json`, then prints stable indexes. Use an index from that output with `script run <index>`. Only one script can run at a time.
+`script list` recursively finds standalone `.gsb` files and directories containing a `manifest.json`, then prints stable indexes. The scan is capped at **32 entries** and **4 directory levels deep**; anything beyond those limits is not listed. Use an index from that output with `script run <index>`. Only one script can run at a time.
 
 On devices with a screen, `script run` opens the GhostScript runner view. On headless devices, it starts a background task and writes script output to the terminal/serial log. `script stop` requests that active script stop; use `script status` to confirm it has become idle.
 
-## Lifecycle of a script
+## Lifecycle of a Script
 
 A script has three phases:
 
@@ -93,10 +92,10 @@ All API calls live under the `ghost` table. Subtables are lazy-loaded on first a
 | `ui`         | `toast`, `set_title`, `screen_width`, `screen_height`.                       |
 | `event`      | `on`, `off`, `emit`, `wait`: pub/sub between scripts and firmware.           |
 | `input`      | `subscribe(topic, fn)`, `unsubscribe(topic, fn)`: aliases for event subscription; use topic `"input"` for all input. |
-| `system`     | `free_heap`, `uptime_ms`, `memory_used`, `memory_limit`, `firmware_version`, `target`, `reboot`, `random`. |
+| `system`     | `free_heap`, `free_internal_heap`, `uptime_ms`, `memory_used`, `memory_limit`, `firmware_version`, `target`, `reboot`, `random` (requires `random` permission). |
 | `storage`    | `read`, `write`, `append`, `delete`, `mkdir`, `list`, `stat`, `rename`, `exists`, bounded logical streams. |
 | `capabilities` | `has_permission(name)`, `has_feature(name)`: inspect manifest authorization and host support. |
-| `wifi`       | `scan_start`, `scan_stop`, `ap_count`, `ap(i)`, `connect`, `disconnect`, `is_connected`, `rssi`, `ip`, `set_channel`, `get_channel`, `deauth`, `on_ap`, `station_scan_start`, `station_scan_stop`, `station_count`, `station(i)`. |
+| `wifi`       | `scan_start`, `scan_stop`, `scan_done`, `scan_finish`, `ap_count`, `ap(i)`, `connect`, `disconnect`, `is_connected`, `rssi`, `ip`, `set_channel`, `get_channel`, `deauth`, `on_ap`, `station_scan_start`, `station_scan_stop`, `station_count`, `station(i)`. |
 | `ble`        | `scan_start`, `scan_stop`, `device_count`, `get_device(i)`, `on_device`.     |
 | `gps`        | `is_available`, `has_fix`, `latitude`, `longitude`, `altitude`, `satellites`, `on_fix`. |
 | `power`      | `percent`, `voltage_mv`, `is_charging`, `get_brightness`, `set_brightness`.  |
@@ -143,7 +142,7 @@ With the `nfc` permission and a local PN532 or ST25R3916 reader, `ghost.nfc.scan
 
 This facade intentionally excludes MIFARE authentication, key recovery, nonce collection, raw page access, emulation, and non-Type-2 protocols. Call `stop()` when finished to release the reader. A successful scan emits the compact `nfc_tag` event (`model|uid`); read the tag object for complete metadata and NDEF bytes.
 
-## Chaining CLI commands
+## Chaining CLI Commands
 
 The killer feature: scripts can call any CLI command, capture its output as events, and decide what to do next based on what came back.
 
@@ -296,7 +295,7 @@ end, { match = "Handshake found" })
 
 If you pass both a builtin filter and a `match_fn`, the builtin runs first and the function only sees what passed.
 
-### Rate limiting
+### Rate Limiting
 
 To keep handlers from drowning the runner, the dispatcher throttles `command.output` to one event per 10 ms per topic. All other topics pass through; add your own throttle inside the handler if you need finer control.
 
@@ -343,7 +342,7 @@ the target-clamped default Lua heap.
 }
 ```
 
-Available permissions include `wifi`, `wifi_control`, `ble`, `nfc`, `ir`, `subghz`, `badusb`, `rgb`, `storage`, `ui`, `commands`, `settings`, `network`, `power`, `display`, `time`, `random`, and `system` (currently required for GPS access). Unknown permission names grant nothing, so a typo normally appears later as `permission denied`.
+Available permissions include `wifi`, `wifi_control`, `ble`, `nfc`, `ir`, `subghz`, `badusb`, `rgb`, `storage`, `ui`, `commands`, `settings`, `network`, `power`, `display`, `time`, `random`, `system`, `tasks`, `gpio` / `raw_gpio`, `lvgl`, `uart` / `serial`, `i2c`, `spi`, `adc`, `pwm`, `input` / `buttons`, `camera`, `usb`, `ethernet` / `eth`, `audio` / `mic`, and `zigbee`. Unknown permission names grant nothing, so a typo normally appears later as `permission denied`.
 
 ## Examples
 
@@ -365,7 +364,7 @@ The repo ships source examples in `examples/ghostscript/src/`. Each needs a fold
 
 These are full workflows you can copy and adapt. Compile them with `gbt script compile` and drop the generated `.gsb` on the SD card.
 
-### Deauth APs by SSID pattern
+### Deauth APs by SSID Pattern
 
 Live-scan for APs and deauth any whose SSID contains a target string. Useful for knocking down rogue APs or running a quick deauth loop against a specific tenant.
 
@@ -401,7 +400,7 @@ print("scanning for SSIDs matching " .. TARGET)
 
 Tune `COOLDOWN_MS` and `BURSTS` to avoid hammering the radio; the per-BSSID cooldown is essential or you'll get a frame storm.
 
-### Stop capture on first handshake
+### Stop Capture on First Handshake
 
 Useful for unattended captures where you only need one 4-way. The script starts `capture -eapol`, waits for `handshake_captured`, and stops capture as soon as one is seen.
 
@@ -432,7 +431,7 @@ ghost.exit()
 
 If you want to filter by AP, set `TARGET_BSSID` to the BSSID string. To capture every handshake on the channel, leave it nil and `ghost.exit()` on the first event.
 
-## Runtime environment
+## Runtime Environment
 
 GhostScript uses Lua 5.4 in 32-bit mode (`LUA_32BITS=1`): integers are 32-bit and floats are 32-bit. This halves memory usage per Lua value compared to 64-bit mode. For hardware scripting (GPIO, radio channels, RSSI, timestamps) this is fully adequate. GPS coordinates retain ~7 digits of precision.
 
@@ -447,10 +446,10 @@ Available standard libraries:
 | `coroutine` | **Not available.** Use `ghost.delay()` and `ghost.event.wait()` for cooperative yielding. |
 | `io`, `os`, `debug`, `package`, `utf8` | **Not available.** Use `ghost.storage` for file I/O. |
 
-## Limits and gotchas
+## Limits and Gotchas
 
 - **Bytecode is limited to 8 KiB per `.gsb` file.** Split the workflow or reduce generated code if the compiled chunk exceeds the limit.
-- **Single task, cooperative yielding.** The script runs on one FreeRTOS task. `ghost.delay` and `ghost.event.wait` yield execution without blocking the UI, but long-running CLI commands still block the script task while they execute. The `coroutine` standard library is not loaded; use `ghost.delay` / `ghost.event.wait` for cooperative work.
+- **Single task, cooperative yielding.** The script runs on one FreeRTOS task. `ghost.delay` and `ghost.event.wait` yield execution without blocking the UI, but long-running CLI commands still block the script task while they execute.
 - **No `require()` of other `.gsb` files.** Each script is a single chunk. Copy helpers between scripts for now.
 - **Most event rates are unbounded.** `command.output` is throttled to one event per 10 ms, but topics such as `ble_device` can still arrive quickly. Keep handlers short and add filtering or throttling where needed.
 - **`ble_device` is deduped per scan.** You get one event per MAC per `ghost.ble.scan_start()`. Use a set in your handler if you need to track across scans.
@@ -465,11 +464,11 @@ Available standard libraries:
       table.insert(fields, unescape(f))
   end
   ```
-- **Output buffer is 4 KB**; older text is trimmed. If you need a full log, `commands.start` to a CLI command that already writes to a file (e.g. `capture -eapol`) instead of capturing in Lua.
+- **Command log buffer is 640 bytes** (8 lines × 80 characters); older lines are trimmed. If you need a full log, pipe a CLI command that already writes to a file (e.g. `capture -eapol`) instead of capturing output in Lua.
 - **No permission prompt at runtime.** If a script doesn't have a permission, the API call errors with `permission denied`. Check the manifest before shipping.
 - **Wi-Fi and BLE share one radio on most ESP32s.** Starting a BLE scan mid-Wi-Fi-scan will tear down Wi-Fi. Drive them sequentially from the same script.
 
-## Compiling and copying with `ghostbt`
+## Compiling and Copying with `ghostbt`
 
 ```bash
 # compile a single file

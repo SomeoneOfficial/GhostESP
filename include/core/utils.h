@@ -65,6 +65,72 @@ void log_heap_status(const char *tag, const char *event);
  */
 void format_mac_address(const uint8_t *mac, char *buffer, size_t buffer_len, bool uppercase);
 
+// ============================================================================
+// Privacy Mode (PII redaction for on-screen display)
+// ============================================================================
+//
+// Privacy mode hides identifying Wi-Fi/BLE data (SSIDs, MAC addresses) that
+// would otherwise end up in wardriving maps and screenshots. It is strictly a
+// display-time transform: it never mutates stored scan data, never affects the
+// data written to wardrive/scan files (CSV, pcap, wigle), and uses no heap or
+// static buffers, so it costs nothing in RAM/BSS when disabled.
+//
+// Callers redact a *copy* of the text they are about to show and must not feed
+// the redacted string back into parsing/lookup logic.
+
+/**
+ * @brief Whether privacy mode is currently enabled (persisted setting).
+ */
+bool privacy_mode_is_enabled(void);
+
+/**
+ * @brief Redact an arbitrary third-party display string in place.
+ *
+ * Masks every printable character with '*' (BLE device names, LAN hostnames,
+ * usernames, GPS coordinates, mesh node names/ids, ...). No-op when privacy
+ * mode is disabled or @p text is NULL.
+ */
+void privacy_redact_text(char *text);
+
+/**
+ * @brief Copy a display string into @p dst (bounded) and redact the copy.
+ */
+void privacy_redact_text_copy(const char *src, char *dst, size_t dst_size);
+
+/**
+ * @brief Redact a real SSID in place for display.
+ *
+ * Printable characters are replaced with '*' so the on-screen length and
+ * layout are preserved. Placeholder labels that carry no PII ("(Hidden)",
+ * "<Hidden>", "Hidden Network", "(Unknown AP)") are left untouched. No-op when
+ * privacy mode is disabled or @p ssid is NULL.
+ *
+ * @param ssid Null-terminated SSID buffer to redact in place
+ */
+void privacy_redact_ssid(char *ssid);
+
+/**
+ * @brief Copy an SSID into @p dst (bounded) and redact the copy for display.
+ */
+void privacy_redact_ssid_copy(const char *src, char *dst, size_t dst_size);
+
+/**
+ * @brief Redact the device-specific half of a formatted MAC string in place.
+ *
+ * "AA:BB:CC:DD:EE:FF" becomes "AA:BB:CC:xx:xx:xx", keeping the vendor OUI.
+ * An 8-character "DD:EE:FF" device-id suffix (no OUI) becomes "xx:xx:xx".
+ * Other lengths are left untouched. No-op when privacy mode is disabled or
+ * @p mac_text is NULL.
+ *
+ * @param mac_text Null-terminated formatted MAC string to redact in place
+ */
+void privacy_redact_mac(char *mac_text);
+
+/**
+ * @brief Format a MAC address and immediately redact it for display.
+ */
+void format_mac_address_masked(const uint8_t *mac, char *buffer, size_t buffer_len, bool uppercase);
+
 /**
  * @brief Build an IP address string from subnet prefix and host number
  * 
@@ -157,6 +223,22 @@ size_t format_hex_bytes(const uint8_t *data, size_t len, char *buf, size_t buf_s
  */
 const char *rssi_to_proximity(int8_t rssi);
 
+/* Small fixed-capacity median filter for smoothing RSSI at the source
+ * (per-packet callbacks). No heap, no IRAM requirements — safe to use from
+ * WiFi promiscuous and NimBLE GAP callbacks. Median rejects single-packet
+ * multipath outliers better than an average; display-level EMA then only
+ * has to polish. */
+#define RSSI_MEDIAN_CAP 8
+
+typedef struct {
+    int8_t v[RSSI_MEDIAN_CAP];
+    uint8_t n;
+} rssi_median_t;
+
+void rssi_median_reset(rssi_median_t *m);
+void rssi_median_push(rssi_median_t *m, int8_t rssi);
+int8_t rssi_median_get(const rssi_median_t *m);
+
 // ============================================================================
 // Network Scanning Utilities
 // ============================================================================
@@ -171,6 +253,26 @@ const char *rssi_to_proximity(int8_t rssi);
  * @return true on success, false on failure (not connected, etc.)
  */
 bool get_wifi_subnet_prefix(char *prefix, size_t prefix_size);
+
+/**
+ * @brief Get the full host scan range from the actual netmask
+ *
+ * Computes first/last usable host IPs (host byte order) from the STA
+ * netmask, capped at /20 (4094 hosts) to keep scan times sane.
+ *
+ * @param prefix Buffer for the network address string (minimum 16 bytes)
+ * @param prefix_size Size of prefix buffer
+ * @param first_host First usable host IP (host byte order), may be NULL
+ * @param last_host Last usable host IP (host byte order), may be NULL
+ * @return true on success, false on failure (not connected, etc.)
+ */
+bool get_wifi_subnet_range(char *prefix, size_t prefix_size,
+                           uint32_t *first_host, uint32_t *last_host);
+
+/**
+ * @brief Format a host-byte-order IPv4 address as a dotted string
+ */
+void ip_u32_to_str(uint32_t ip_host_order, char *out, size_t out_size);
 
 /**
  * @brief Connect to a TCP port with timeout

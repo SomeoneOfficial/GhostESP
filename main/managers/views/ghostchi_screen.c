@@ -1,5 +1,6 @@
 #include "managers/views/ghostchi_screen.h"
 #include "core/ghostchi_identity.h"
+#include "core/utils.h"
 #include "gui/design_tokens.h"
 
 #include "gui/lvgl_safe.h"
@@ -745,7 +746,8 @@ static void layout_stats(void) {
         lv_obj_add_flag(s_hint_label, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_clear_flag(s_hint_label, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, has_touch_controls() ? -38 : -8);
+        lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0,
+                     -(GUI_HOME_SAFE_H + (has_touch_controls() ? 38 : 8)));
     }
 
     if (is_portrait_layout()) {
@@ -996,7 +998,8 @@ static void update_ui(lv_timer_t *timer) {
         lv_obj_add_flag(s_hint_label, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_clear_flag(s_hint_label, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, has_touch_controls() ? -38 : -8);
+        lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0,
+                     -(GUI_HOME_SAFE_H + (has_touch_controls() ? 38 : 8)));
     }
 
     if (has_touch_controls()) {
@@ -1006,7 +1009,7 @@ static void update_ui(lv_timer_t *timer) {
         int btn_h = 18;
         int btn_gap = 4;
         int btn_x = 12;
-        btn_y = content_h - btn_h - 10;
+        btn_y = content_h - GUI_HOME_SAFE_H - btn_h - 10;
         lv_obj_clear_flag(s_touch_btn_left, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_touch_btn_mid, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_touch_btn_right, LV_OBJ_FLAG_HIDDEN);
@@ -1082,7 +1085,9 @@ static void update_ui(lv_timer_t *timer) {
         set_stat(1, "CH", snap.current_channel ? buf : "--");
         snprintf(buf, sizeof(buf), "%u", (unsigned)snap.aps_visible);
         set_stat(2, "APS", buf);
-        set_stat(3, "TARGET", snap.target_ssid[0] ? snap.target_ssid : "None");
+        char target_disp[sizeof(snap.target_ssid)];
+        privacy_redact_ssid_copy(snap.target_ssid, target_disp, sizeof(target_disp));
+        set_stat(3, "TARGET", snap.target_ssid[0] ? target_disp : "None");
         snprintf(buf, sizeof(buf), "%u", (unsigned)snap.handshakes);
         set_stat(4, "PWND", buf);
         snprintf(buf, sizeof(buf), "%u%%", (unsigned)snap.confidence);
@@ -1297,7 +1302,7 @@ static void ghostchi_input_handler(InputEvent *event) {
             int gy;
             s_touch_started = false;
             if (abs(dx) < TAP_THRESHOLD && abs(dy) < TAP_THRESHOLD) {
-                if (data->point.y > (LV_VER_RES - 26)) {
+                if (data->point.y > (LV_VER_RES - GUI_HOME_SAFE_H - 26)) {
                     int zone = (data->point.x * 3) / LV_HOR_RES;
                     if (zone < 0) zone = 0;
                     if (zone > 2) zone = 2;

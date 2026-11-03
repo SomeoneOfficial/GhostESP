@@ -583,9 +583,10 @@ static void dispatch_event(ghostscript_runtime_t *rt, const char *name, const ch
         for (int i = 1; i <= n; i += 2) {
             lua_rawgeti(rt->L, -1, i);
             if (!lua_isfunction(rt->L, -1)) { lua_pop(rt->L, 1); continue; }
-            /* Filter is at i+1. */
+            /* Filter is at i+1 in the listener table, which is at -2: the
+             * handler function pushed above is at -1. */
             if (i + 1 <= n) {
-                lua_rawgeti(rt->L, -1, i + 1);
+                lua_rawgeti(rt->L, -2, i + 1);
                 if (lua_isnil(rt->L, -1) || lua_isboolean(rt->L, -1)) {
                     lua_pop(rt->L, 1);
                 } else {
@@ -2602,6 +2603,8 @@ static int l_initialize_runtime(lua_State *L) {
     luaL_requiref(L, "table", luaopen_table, 1); lua_pop(L, 1);
     open_math_lite(L);
     register_api(L, rt);
+    lua_gc(L, LUA_GCSETPAUSE, 150);
+    lua_gc(L, LUA_GCCOLLECT);
     lua_newthread(L);
     return 1;
 }
@@ -2672,13 +2675,16 @@ static bool runtime_resume_script(ghostscript_runtime_t *rt) {
     int nres = 0;
     runtime_begin_slice(rt);
     int rc = lua_resume(rt->thread, NULL, 0, &nres);
-    if (nres > 0) lua_pop(rt->thread, nres);
     if (rc == LUA_OK) {
+        if (nres > 0) lua_pop(rt->thread, nres);
         rt->script_done = true;
         runtime_finish_script_if_needed(rt);
         return true;
     }
-    if (rc == LUA_YIELD) return true;
+    if (rc == LUA_YIELD) {
+        if (nres > 0) lua_pop(rt->thread, nres);
+        return true;
+    }
     if (runtime_finish_requested_exit(rt, rt->thread)) return true;
     runtime_set_lua_error(rt, rt->thread, rc);
     rt->state = GHOSTSCRIPT_STATE_FAILED;
@@ -2852,6 +2858,7 @@ static void runtime_process_input(ghostscript_runtime_t *rt, const InputEvent *e
         case INPUT_TYPE_KEYBOARD: type = "keyboard"; break;
         case INPUT_TYPE_ENCODER: type = "encoder"; break;
         case INPUT_TYPE_EXIT_BUTTON: type = "back"; break;
+        case INPUT_TYPE_HOME_BUTTON: type = "home"; break;
     }
     lua_pushstring(rt->L, type); lua_setfield(rt->L, -2, "type");
     if (event->type == INPUT_TYPE_KEYBOARD) { lua_pushinteger(rt->L, event->data.key_value); lua_setfield(rt->L, -2, "key"); }

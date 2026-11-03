@@ -127,14 +127,12 @@ static bool sd_cli_display_suspended = false;
 
 static bool sd_cli_ensure_mounted(void) {
     if (sd_card_manager.is_initialized) return true;
-#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
-    if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0) {
+    if (sd_card_needs_jit_mount()) {
         if (sd_card_mount_for_flush(&sd_cli_display_suspended) == ESP_OK) {
             sd_cli_jit_mounted = true;
             return true;
         }
     }
-#endif
     return false;
 }
 
@@ -144,13 +142,11 @@ static void sd_cli_cleanup(void) {
         g_sd_cli_paths[i] = NULL;
     }
     g_sd_cli_count = 0;
-#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
     if (sd_cli_jit_mounted) {
         sd_card_unmount_after_flush(sd_cli_display_suspended);
         sd_cli_jit_mounted = false;
         sd_cli_display_suspended = false;
     }
-#endif
 }
 
 void handle_sd_cmd(int argc, char **argv) {
@@ -420,7 +416,17 @@ void handle_sd_cmd(int argc, char **argv) {
                     break;
                 }
                 b64[written] = '\0';
-                glog("SD:READ:DATA:%s\n", b64);
+                /* glog truncates output at 511 bytes, so a 1024-char base64 line
+                 * would be cut mid-character. Emit 4-aligned pieces that each fit
+                 * the glog buffer; the host parser decodes and concatenates them. */
+                const size_t b64_line_max = 480; /* multiple of 4, 13 + 480 + 1 < 512 */
+                size_t pos = 0;
+                while (pos < written) {
+                    size_t piece = written - pos;
+                    if (piece > b64_line_max) piece = b64_line_max;
+                    glog("SD:READ:DATA:%.*s\n", (int)piece, b64 + pos);
+                    pos += piece;
+                }
             } else {
                 size_t out_written = fwrite(buf, 1, to_write, stdout);
                 if (out_written != to_write) {

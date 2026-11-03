@@ -552,7 +552,7 @@ static void enter_folder(cloud_store_item_type_t type) {
 // category chooser and top level both exit outward from there.
 static void go_up_level(void) {
     if (s_section == CLOUD_SECTION_TOP) {
-        display_manager_switch_view(&apps_menu_view);
+        display_manager_go_back();
         return;
     }
     if (s_level == SECTION_LEVEL_ITEMS && s_category_level_exists) {
@@ -687,13 +687,17 @@ static void status_timer_cb(lv_timer_t *timer) {
     if (s_progress && (status.state == CLOUD_STORE_STATE_DOWNLOADING || status.state == CLOUD_STORE_STATE_INSTALLING)) {
         bool downloading = (status.state == CLOUD_STORE_STATE_DOWNLOADING);
         progress_bar_view_update(s_progress, downloading ? "Downloading" : "Installing");
-        progress_bar_view_set_progress(s_progress, status.bytes_done, status.bytes_total);
         if (downloading) {
+            progress_bar_view_set_progress(s_progress, status.bytes_done, status.bytes_total);
             // Downloads are abortable; installs (flash write) are not.
             char sub[CLOUD_STORE_NAME_MAX + 24];
             snprintf(sub, sizeof(sub), "%s\n" LV_SYMBOL_LEFT " Back to cancel", status.active_name);
             progress_bar_view_set_subtext(s_progress, sub);
         } else {
+            // The install/extract phase reports no byte counters (the status
+            // carries 0/0), so animating the bar is all we can show -- without
+            // this it would render a bogus "0 KB downloaded" label.
+            progress_bar_view_set_indeterminate(s_progress);
             progress_bar_view_set_subtext(s_progress, status.active_name);
         }
     }
@@ -952,7 +956,7 @@ static void cloud_store_input(InputEvent *event) {
         }
         return;
     }
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_IS_ATOMS3R)
     if (event->type == INPUT_TYPE_EXIT_BUTTON && event->data.exit_pressed) {
         if (popup_confirm_is_open(s_confirm_popup)) {
             popup_confirm_close(&s_confirm_popup);

@@ -33,6 +33,7 @@ bool badusb_hid_mouse_send(int8_t dx, int8_t dy, uint8_t buttons);
 bool badusb_hid_mouse_wheel_send(int8_t wheel, uint8_t buttons);
 bool badusb_hid_mouse_buttons_send(uint8_t buttons);
 uint8_t badusb_manager_mouse_interface(void);
+bool badusb_manager_send_consumer(uint8_t control_mask);
 
 // Mouse jiggler: moves mouse periodically to keep PC awake
 esp_err_t badusb_manager_mouse_jiggle_start(void);

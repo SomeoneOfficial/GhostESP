@@ -64,6 +64,13 @@ static const uint8_t hid_mouse_report_descriptor[] = {
 #define hid_keyboard_report_desc hid_keyboard_report_descriptor
 #define hid_mouse_report_desc hid_mouse_report_descriptor
 
+static const uint8_t hid_consumer_report_desc[] = {
+    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x15, 0x00, 0x25, 0x01,
+    0x75, 0x01, 0x95, 0x03, 0x0A, 0xE9, 0x00, 0x0A, 0xEA, 0x00,
+    0x0A, 0xE2, 0x00, 0x81, 0x02, 0x75, 0x05, 0x95, 0x01, 0x81,
+    0x01, 0xC0
+};
+
 static bool s_initialized = false;
 static bool s_driver_installed = false;
 static bool s_active = false;
@@ -79,6 +86,7 @@ static badusb_usb_mode_t s_usb_mode = BADUSB_USB_MODE_KEYBOARD;
 #define BADUSB_COMPOSITE_HID_PID 0x0002
 #define BADUSB_MOUSE_PID 0x0003
 #define MIN_KEY_DELAY_MS 10
+#define CONSUMER_HID_INTERVAL_MS 2
 static tusb_desc_device_t device_descriptor = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
@@ -99,19 +107,22 @@ static tusb_desc_device_t device_descriptor = {
 enum {
     ITF_NUM_HID_KEYBOARD,
     ITF_NUM_HID_MOUSE,
+    ITF_NUM_HID_CONSUMER,
     ITF_NUM_TOTAL
 };
 
 enum {
     HID_INSTANCE_KEYBOARD,
     HID_INSTANCE_MOUSE,
+    HID_INSTANCE_CONSUMER,
 };
 
 #define EPNUM_HID_KEYBOARD  0x81
 #define EPNUM_HID_MOUSE     0x82
+#define EPNUM_HID_CONSUMER  0x83
 
 // Each TUD_HID_DESC_LEN is 9+7+7 = 23 bytes
-#define BADUSB_CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_DESC_LEN)
+#define BADUSB_CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_DESC_LEN)
 
 static const uint8_t keyboard_configuration_descriptor[] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, BADUSB_CONFIG_TOTAL_LEN, 0x00, 100),
@@ -119,6 +130,9 @@ static const uint8_t keyboard_configuration_descriptor[] = {
                        sizeof(hid_keyboard_report_desc), EPNUM_HID_KEYBOARD, CFG_TUD_HID_EP_BUFSIZE, 1),
     TUD_HID_DESCRIPTOR(ITF_NUM_HID_MOUSE, 0, HID_ITF_PROTOCOL_MOUSE,
                        sizeof(hid_mouse_report_desc), EPNUM_HID_MOUSE, CFG_TUD_HID_EP_BUFSIZE, 1),
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID_CONSUMER, 0, HID_ITF_PROTOCOL_NONE,
+                       sizeof(hid_consumer_report_desc), EPNUM_HID_CONSUMER,
+                       CFG_TUD_HID_EP_BUFSIZE, CONSUMER_HID_INTERVAL_MS),
 };
 
 static const uint8_t mouse_configuration_descriptor[] = {
@@ -127,6 +141,9 @@ static const uint8_t mouse_configuration_descriptor[] = {
                        sizeof(hid_mouse_report_desc), EPNUM_HID_MOUSE, CFG_TUD_HID_EP_BUFSIZE, 1),
     TUD_HID_DESCRIPTOR(ITF_NUM_HID_KEYBOARD, 0, HID_ITF_PROTOCOL_KEYBOARD,
                        sizeof(hid_keyboard_report_desc), EPNUM_HID_KEYBOARD, CFG_TUD_HID_EP_BUFSIZE, 1),
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID_CONSUMER, 0, HID_ITF_PROTOCOL_NONE,
+                       sizeof(hid_consumer_report_desc), EPNUM_HID_CONSUMER,
+                       CFG_TUD_HID_EP_BUFSIZE, CONSUMER_HID_INTERVAL_MS),
 };
 
 static char mfr_string[33] = "Ghost ESP";
@@ -154,10 +171,28 @@ uint8_t badusb_manager_mouse_interface(void) {
 }
 
 const uint8_t *tud_hid_descriptor_report_cb(uint8_t instance) {
+    if (instance == HID_INSTANCE_CONSUMER) return hid_consumer_report_desc;
     if (s_usb_mode == BADUSB_USB_MODE_MOUSE) {
         return (instance == 0) ? hid_mouse_report_descriptor : hid_keyboard_report_descriptor;
     }
     return (instance == ITF_NUM_HID_MOUSE) ? hid_mouse_report_descriptor : hid_keyboard_report_descriptor;
+}
+
+bool badusb_manager_send_consumer(uint8_t control_mask) {
+    if (!s_active || control_mask == 0) return false;
+    int timeout = 100;
+    while (!tud_hid_n_ready(HID_INSTANCE_CONSUMER) && timeout-- > 0) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (!tud_hid_n_ready(HID_INSTANCE_CONSUMER)) return false;
+    uint8_t release = 0;
+    if (!tud_hid_n_report(HID_INSTANCE_CONSUMER, 0, &control_mask, 1)) return false;
+    timeout = 100;
+    while (!tud_hid_n_ready(HID_INSTANCE_CONSUMER) && timeout-- > 0) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return tud_hid_n_ready(HID_INSTANCE_CONSUMER) &&
+           tud_hid_n_report(HID_INSTANCE_CONSUMER, 0, &release, 1);
 }
 
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,

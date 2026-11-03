@@ -1,8 +1,10 @@
 #include "managers/views/music_visualizer.h"
 
 #include "gui/lvgl_safe.h"
+#include "gui/view_input.h"
 #include "gui/screen_layout.h"
 #include "gui/theme_palette_api.h"
+#include "gui/design_tokens.h"
 #include "managers/display_manager.h"
 #include "managers/settings_manager.h"
 #include "gui/accessibility_fonts.h"
@@ -308,7 +310,22 @@ static void handle_hardware_input_music_callback(InputEvent *event) {
         return;
     }
 
-    return_to_apps();
+    if (view_input_wants_back(event)) {
+        return_to_apps();
+        return;
+    }
+    if (event->type == INPUT_TYPE_JOYSTICK && event->data.joystick_index == 0) {
+        return_to_apps();
+        return;
+    }
+#if defined(CONFIG_USE_ENCODER)
+    if (event->type == INPUT_TYPE_ENCODER && event->data.encoder.button) {
+        return_to_apps();
+        return;
+    }
+#endif
+    /* Ignore all other input (joystick motion, rotation, keys) so the
+     * visualizer cannot be dismissed accidentally. */
 }
 
 static void get_music_visualizer_callback(void **callback) {
@@ -365,7 +382,7 @@ void music_visualizer_view_create(void) {
     debug_label = lv_label_create(root);
     lv_obj_set_style_text_font(debug_label, accessibility_get_font_small(), 0);
     lv_obj_set_style_text_color(debug_label, theme_muted, 0);
-    lv_obj_align(debug_label, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_align(debug_label, LV_ALIGN_BOTTOM_MID, 0, -(GUI_HOME_SAFE_H + 4));
     lv_label_set_text(debug_label, "frames 0  idle");
 
     if (!amplitude_queue) {

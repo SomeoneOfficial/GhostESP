@@ -1,10 +1,10 @@
 ---
 title: "GhostESP: Revival"
-description: "GhostESP is a multi-protocol security testing toolkit for ESP32 devices. Scan Wi-Fi networks, capture handshakes, launch attacks, read NFC tags, learn and transmit IR signals, and more."
+description: "GhostESP is a Wi-Fi pentesting and multi-protocol wireless security platform for ESP32 devices. Scan Wi-Fi networks, capture handshakes, launch attacks, read NFC tags, learn and transmit IR signals, and more"
 keywords: ["ESP32", "security testing", "WiFi", "NFC", "infrared", "penetration testing", "toolkit", "wireless security"]
 ---
 
-## Start here
+## Start Here
 
 <div class="doc__cards">
   <a class="doc__card" href="{{< relref "getting-started/supported-hardware.md" >}}">
@@ -25,9 +25,9 @@ keywords: ["ESP32", "security testing", "WiFi", "NFC", "infrared", "penetration 
   </a>
 </div>
 
-## Explore capabilities
+**Stuck?** The [FAQ]({{< relref "getting-started/faq.md" >}}) covers setup, credentials, and common failures. If you are adding a module or changing pins, see [Wiring Modules and Peripherals]({{< relref "getting-started/peripheral-wiring.md" >}}).
 
-Choose a section below when you already know what you want to do.
+## Explore Capabilities
 
 <div class="doc__cards">
   <a class="doc__card" href="{{< relref "wifi/_index.md" >}}">
@@ -54,13 +54,17 @@ Choose a section below when you already know what you want to do.
     <h2>GPS</h2>
     <p>Log wardrives and tag captures with location data.</p>
   </a>
-  <a class="doc__card" href="{{< relref "camera/_index.md" >}}">
-    <h2>Camera</h2>
-    <p>Stream MJPEG video and run motion detection.</p>
+  <a class="doc__card" href="{{< relref "lora/_index.md" >}}">
+    <h2>LoRa</h2>
+    <p>Meshtastic chat on SX1262, BLE app link, stock radio interop.</p>
   </a>
   <a class="doc__card" href="{{< relref "ethernet/_index.md" >}}">
     <h2>Ethernet</h2>
     <p>Fingerprint hosts and scan the wired network.</p>
+  </a>
+  <a class="doc__card" href="{{< relref "camera/_index.md" >}}">
+    <h2>Camera</h2>
+    <p>Stream MJPEG video and run motion detection.</p>
   </a>
   <a class="doc__card" href="{{< relref "usb/_index.md" >}}">
     <h2>USB</h2>

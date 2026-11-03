@@ -9,15 +9,15 @@ aliases:
 
 GhostESP lets you learn IR signals, store them on the SD card, and retransmit them using the onboard LED.
 
-## Supported protocols
+## Supported Protocols
 
-- NEC / NECext
+- NEC / NECext / NEC42 / NEC42ext
 - Kaseikyo
 - Pioneer
 - RCA
-- Samsung
+- Samsung32
 - SIRC (12-bit, 15-bit, 20-bit)
-- RC5
+- RC5 / RC5X
 - RC6
 
 If a remote uses an unsupported protocol, GhostESP still attempts to capture raw timings so you can replay the signal.

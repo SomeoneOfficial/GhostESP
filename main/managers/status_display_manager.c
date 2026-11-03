@@ -21,7 +21,18 @@
 #include "freertos/task.h"
 #include "i2c_bus_lock.h"
 #include "managers/settings_manager.h"
+#include "core/utils.h"
 #include "managers/status_display_animations.h"
+#ifdef CONFIG_HAS_LORA
+#include "managers/lora_manager.h"
+#include "managers/lora_mesh.h"
+#include "managers/lora_phoneapi.h"
+#endif
+#ifdef CONFIG_HAS_MESHCORE
+#include "managers/meshcore_manager.h"
+#include "managers/meshcore_mesh.h"
+#include "managers/meshcore_ble.h"
+#endif
 
 static esp_err_t status_display_send(uint8_t control, const uint8_t *data, size_t len);
 
@@ -49,10 +60,13 @@ static uint8_t *s_buffer;
 static uint8_t s_dirty_pages; // pages pending flush (bit = page)
 static uint8_t s_drawn_pages; // pages drawn in the last render pass
 #define STATUS_BUFFER_SIZE (128 * 8)
-#define STATUS_ANIM_TASK_STACK_BYTES 3072
+#define STATUS_ANIM_TASK_STACK_BYTES 4096
 static char s_line1[24];
 static char s_line2[24];
-static const int SCALE_Y = 2; // simple vertical scaling factor
+// Set by status_display_set_lines_hold(): the held content (e.g. the BLE
+// pairing PIN) owns the panel until status_display_clear() releases it.
+static bool s_hold_display;
+static const int SCALE_Y = CONFIG_STATUS_DISPLAY_SCALE_Y; // 1=1:1 pixels, 2=double-height
 #if defined(CONFIG_USE_IO_EXPANDER)
 static TickType_t s_next_flush_allowed_tick;
 static const TickType_t STATUS_DISPLAY_MIN_FLUSH_INTERVAL_TICKS = pdMS_TO_TICKS(200);
@@ -70,6 +84,103 @@ static StaticTask_t *s_anim_task_tcb;
 static TickType_t s_next_anim_allowed_tick;
 static TickType_t s_oom_backoff_until;
 static bool s_oom_logged;
+#ifdef CONFIG_HAS_LORA
+static TickType_t s_last_lora_hud_tick;
+#define LORA_MESSAGE_PREVIEW_TICKS pdMS_TO_TICKS(8000)
+// 0 = the compact LoRa page, 1..9 = the normal selectable idle animations.
+// The PRG button cycles pages; on the compact page a double press toggles the
+// selected mesh radio (start when off, stop when on).
+static uint8_t s_lora_page;
+static bool s_lora_was_running;
+static uint16_t s_lora_last_nodes;
+static uint32_t s_lora_last_incoming_seq;
+static TickType_t s_lora_preview_started_tick;
+static bool s_lora_preview_visible;
+static char s_lora_preview_who[24];
+static char s_lora_preview_text[96];
+/* Scratch for the compact page's last-message line. Kept off the status task
+ * stack (this board has no PSRAM, so the stack is a small internal one and
+ * lora_msg_t alone is ~200 bytes). */
+static lora_msg_t s_hud_last_msg;
+static char s_hud_who[24];
+static char s_hud_text[96];
+#ifdef CONFIG_HAS_MESHCORE
+static mc_msg_t s_hud_mc_msg;   /* MeshCore message scratch, off the task stack */
+#endif
+/* Double-press window for the PRG button on the compact page. The button is
+ * sampled by the 150 ms animation tick, so the window must span at least two
+ * samples (a press pair lands ~150-300 ms apart). The first press is held this
+ * long so it cannot pre-empt the toggle. */
+#define LORA_HUD_DOUBLE_PRESS_TICKS pdMS_TO_TICKS(400)
+/* Press debounce. Must be well under the double-press window (and under the
+ * 150 ms sampling period) or the second press is swallowed. */
+#define LORA_HUD_BUTTON_DEBOUNCE_TICKS pdMS_TO_TICKS(120)
+static bool s_hud_press_armed;
+static TickType_t s_hud_press_tick;
+
+/* The persisted backend choice (shared with the app toggle and the `mesh` CLI). */
+static bool status_display_meshcore_selected(void) {
+#ifdef CONFIG_HAS_MESHCORE
+    return mc_manager_default_backend_meshcore();
+#else
+    return false;
+#endif
+}
+
+/* True while the selected mesh owns the radio. */
+static bool status_display_mesh_running(void) {
+#ifdef CONFIG_HAS_MESHCORE
+    if (mc_manager_is_running()) return true;
+#endif
+    return lora_manager_is_running();
+}
+
+/* Start/stop the selected mesh from the compact page, mirroring the on-screen
+ * LoRa toggle so the persisted backend is respected. */
+static void status_display_toggle_radio(void) {
+#ifdef CONFIG_HAS_MESHCORE
+    if (status_display_meshcore_selected()) {
+        if (mc_manager_is_running()) mc_manager_stop();
+        else (void)mc_manager_start();
+        return;
+    }
+#endif
+    if (lora_manager_is_running()) lora_manager_stop();
+    else if (!lora_manager_needs_setup()) (void)lora_manager_start();
+}
+
+/* Backend the compact page presents: the live radio owner, else the persisted
+ * choice — the same rule the on-device LoRa app uses. */
+static bool status_display_meshcore_active(void) {
+#ifdef CONFIG_HAS_MESHCORE
+    if (mc_manager_is_running()) return true;
+    if (lora_manager_is_running()) return false;
+#endif
+    return status_display_meshcore_selected();
+}
+
+/* Companion app-link state for the backend being shown. */
+static bool status_display_app_linked(bool meshcore) {
+#ifdef CONFIG_HAS_MESHCORE
+    if (meshcore) return mc_ble_is_linked();
+#else
+    (void)meshcore;
+#endif
+    return lora_phoneapi_is_linked();
+}
+
+#ifdef CONFIG_HAS_MESHCORE
+/* Newest received MeshCore message (the ring also holds our own sends). */
+static bool status_display_mc_latest_incoming(mc_msg_t *out) {
+    if (!out) return false;
+    for (uint16_t i = mc_manager_msg_count(); i > 0; --i) {
+        if (!mc_manager_msg_at((uint16_t)(i - 1), out)) continue;
+        if (!out->outgoing) return true;
+    }
+    return false;
+}
+#endif
+#endif
 // static int s_i2c_error_streak; // unused
 
 static esp_err_t status_display_init_i2c(void) {
@@ -263,6 +374,242 @@ static void status_display_draw_text(int x, int y, const char *text) {
     }
 }
 
+#ifdef CONFIG_HAS_LORA
+static void status_display_lora_frame_locked(void) {
+    s_dirty_pages |= s_drawn_pages;
+    s_drawn_pages = 0;
+    status_display_clear_buffer();
+
+    // A simple frame keeps this page distinct while leaving room for readable text.
+    for (int x = 0; x < 128; x++) {
+        status_display_plot_pixel(x, 0, true);
+        status_display_plot_pixel(x, 63, true);
+    }
+    for (int y = 0; y < 64; y++) {
+        status_display_plot_pixel(0, y, true);
+        status_display_plot_pixel(127, y, true);
+    }
+    for (int x = 1; x < 127; x++) status_display_plot_pixel(x, 11, true);
+}
+
+static void status_display_lora_copy_preview(char *out, size_t out_len,
+                                             const char *in) {
+    if (!out || out_len == 0) return;
+    size_t used = 0;
+    bool last_space = true;
+    while (in && *in && used + 1 < out_len) {
+        unsigned char c = (unsigned char)*in++;
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+        if (c < 32 || c > 126) c = '?';
+        if (c == ' ' && last_space) continue;
+        out[used++] = (char)c;
+        last_space = (c == ' ');
+    }
+    while (used > 0 && out[used - 1] == ' ') used--;
+    out[used] = '\0';
+}
+
+static const char *status_display_lora_wrap_line(const char *src, char out[21]) {
+    while (*src == ' ') src++;
+    size_t left = strlen(src);
+    size_t take = left > 20 ? 20 : left;
+    if (left > 20) {
+        size_t split = take;
+        while (split > 0 && src[split] != ' ') split--;
+        if (split > 0) take = split;
+    }
+    memcpy(out, src, take);
+    out[take] = '\0';
+    src += take;
+    while (*src == ' ') src++;
+    return src;
+}
+
+static bool status_display_lora_preview_update(TickType_t now) {
+    bool have_new = false;
+    if (status_display_meshcore_active()) {
+#ifdef CONFIG_HAS_MESHCORE
+        uint32_t seq = 0;
+        if (mc_manager_latest_message(&s_hud_mc_msg, &seq) &&
+            seq != 0 && seq != s_lora_last_incoming_seq) {
+            s_lora_last_incoming_seq = seq;
+            /* Only received traffic gets a preview, never our own sends. */
+            have_new = !s_hud_mc_msg.outgoing;
+            if (have_new) {
+                status_display_lora_copy_preview(s_lora_preview_who,
+                                                 sizeof(s_lora_preview_who), s_hud_mc_msg.who);
+                status_display_lora_copy_preview(s_lora_preview_text,
+                                                 sizeof(s_lora_preview_text), s_hud_mc_msg.text);
+            }
+        }
+#endif
+    } else {
+        uint32_t seq = 0;
+        if (lora_manager_latest_incoming(&s_hud_last_msg, &seq) &&
+            seq != 0 && seq != s_lora_last_incoming_seq) {
+            s_lora_last_incoming_seq = seq;
+            have_new = true;
+            status_display_lora_copy_preview(s_lora_preview_who,
+                                             sizeof(s_lora_preview_who), s_hud_last_msg.who);
+            status_display_lora_copy_preview(s_lora_preview_text,
+                                             sizeof(s_lora_preview_text), s_hud_last_msg.text);
+        }
+    }
+    if (have_new) {
+        if (s_lora_preview_who[0] == '\0') snprintf(s_lora_preview_who, sizeof(s_lora_preview_who), "UNKNOWN");
+        if (s_lora_preview_text[0] == '\0') snprintf(s_lora_preview_text, sizeof(s_lora_preview_text), "(empty message)");
+        s_lora_preview_started_tick = now;
+        s_lora_preview_visible = true;
+        s_last_lora_hud_tick = 0;
+        ESP_LOGI(TAG, "message preview: %.20s: %.40s",
+                 s_lora_preview_who, s_lora_preview_text);
+    }
+    if (s_lora_preview_visible &&
+        now - s_lora_preview_started_tick >= LORA_MESSAGE_PREVIEW_TICKS) {
+        s_lora_preview_visible = false;
+        s_last_lora_hud_tick = 0;
+    }
+    return s_lora_preview_visible;
+}
+
+static void status_display_render_lora_preview_locked(void) {
+    if (!s_buffer) return;
+    status_display_lora_frame_locked();
+
+    bool dm = strncmp(s_lora_preview_who, "DM:", 3) == 0;
+    const char *who = dm ? s_lora_preview_who + 3 : s_lora_preview_who;
+    char line[24];
+    snprintf(line, sizeof(line), "%s  %s", dm ? "NEW DM" : "NEW CHAT",
+             status_display_app_linked(status_display_meshcore_active()) ? "APP:LINK"
+                                                                         : "APP:WAIT");
+    status_display_draw_text(4, 2, line);
+    char who_disp[sizeof(s_lora_preview_who)];
+    snprintf(who_disp, sizeof(who_disp), "%s", who);
+    privacy_redact_text(who_disp);
+    snprintf(line, sizeof(line), "FROM: %.14s", who_disp);
+    status_display_draw_text(4, 15, line);
+
+    const char *next = s_lora_preview_text;
+    for (int row = 0; row < 3; row++) {
+        char wrapped[21];
+        next = status_display_lora_wrap_line(next, wrapped);
+        status_display_draw_text(4, 27 + row * 12, wrapped);
+        if (*next == '\0') break;
+    }
+    status_display_flush();
+}
+
+static void status_display_render_lora_hud_locked(const lora_status_t *st,
+                                                   bool mesh_running,
+                                                   bool meshcore,
+                                                   TickType_t now) {
+    if (!st || !s_buffer) return;
+    status_display_lora_frame_locked();
+
+    char line[24];
+    const char *headline = !mesh_running ? (meshcore ? "MC OFF" : "LORA OFF")
+                          : (st->node_count > s_lora_last_nodes) ? "NEW NODE"
+                          : (meshcore ? "MESHCORE" : "LORA");
+    snprintf(line, sizeof(line), "%s  %s", headline,
+             status_display_app_linked(meshcore) ? "APP:LINK" : "APP:WAIT");
+    status_display_draw_text(4, 2, line);
+
+    uint32_t mhz = st->freq_hz / 1000000u;
+    uint32_t khz = (st->freq_hz % 1000000u) / 1000u;
+    if (meshcore) {
+        /* MeshCore has no region/band-plan concept, just a frequency. */
+        snprintf(line, sizeof(line), "MC %u.%03u SF%d", (unsigned)mhz, (unsigned)khz, st->sf);
+    } else {
+        snprintf(line, sizeof(line), "%s %u.%03u SF%d",
+                 lora_region_name((int)st->region), (unsigned)mhz, (unsigned)khz, st->sf);
+    }
+    status_display_draw_text(4, 15, line);
+
+#ifdef CONFIG_HAS_MESHCORE
+    unsigned msgs = meshcore ? (unsigned)mc_manager_msg_count()
+                             : (unsigned)lora_manager_msg_count();
+#else
+    unsigned msgs = (unsigned)lora_manager_msg_count();
+#endif
+    if (meshcore) {
+        /* No hop limit / relay in MeshCore. */
+        snprintf(line, sizeof(line), "N:%d M:%u", st->node_count, msgs);
+    } else {
+        snprintf(line, sizeof(line), "N:%d M:%u H:%d", st->node_count, msgs, st->hop_limit);
+    }
+    status_display_draw_text(4, 27, line);
+
+    if (meshcore) {
+        snprintf(line, sizeof(line), "TX:%lu RX:%lu",
+                 (unsigned long)st->tx_ok, (unsigned long)st->rx_ok);
+    } else {
+        snprintf(line, sizeof(line), "TX:%lu RX:%lu R:%lu",
+                 (unsigned long)st->tx_ok, (unsigned long)st->rx_ok,
+                 (unsigned long)st->tx_relay);
+    }
+    status_display_draw_text(4, 39, line);
+
+    uint32_t errors = st->tx_fail + st->rx_crc_err;
+    uint32_t drops = st->q_drops + st->duty_drops;
+    bool show_health = (errors || drops) &&
+                       (((now / pdMS_TO_TICKS(3000)) & 1u) != 0);
+
+    /* Newest received message for the backend being shown. */
+    const char *msg_text = NULL;
+    if (mesh_running) {
+        if (meshcore) {
+#ifdef CONFIG_HAS_MESHCORE
+            if (status_display_mc_latest_incoming(&s_hud_mc_msg)) {
+                status_display_lora_copy_preview(s_hud_who, sizeof(s_hud_who), s_hud_mc_msg.who);
+                status_display_lora_copy_preview(s_hud_text, sizeof(s_hud_text), s_hud_mc_msg.text);
+                msg_text = s_hud_text;
+            }
+#endif
+        } else {
+            uint32_t seq = 0;
+            if (lora_manager_latest_incoming(&s_hud_last_msg, &seq)) {
+                status_display_lora_copy_preview(s_hud_who, sizeof(s_hud_who), s_hud_last_msg.who);
+                status_display_lora_copy_preview(s_hud_text, sizeof(s_hud_text), s_hud_last_msg.text);
+                msg_text = s_hud_text;
+            }
+        }
+    }
+    const char *who_txt = s_hud_who;
+    if (msg_text && strncmp(who_txt, "DM:", 3) == 0) who_txt += 3;
+
+    if (!mesh_running) {
+        /* Stopped: say exactly how to bring the radio up from this page. */
+        const char *hint = (!status_display_meshcore_selected() &&
+                            lora_manager_needs_setup())
+                               ? "SET REGION IN APP"
+                               : "PRESS 2X TO START";
+        snprintf(line, sizeof(line), "%s", hint);
+    } else if (msg_text && (who_txt[0] || msg_text[0])) {
+        /* Keep the most recent message on screen instead of only showing it
+         * during the new-message preview. */
+        char who_disp[sizeof(s_hud_who)];
+        snprintf(who_disp, sizeof(who_disp), "%s", who_txt);
+        privacy_redact_text(who_disp);
+        snprintf(line, sizeof(line), "%.7s: %.12s",
+                 who_disp[0] ? who_disp : "UNKNOWN",
+                 msg_text[0] ? msg_text : "(empty)");
+    } else if (show_health) {
+        snprintf(line, sizeof(line), "ERR:%lu Q:%lu DUP:%lu",
+                 (unsigned long)errors, (unsigned long)drops,
+                 (unsigned long)st->rx_dups);
+    } else if (st->last_rssi != 0) {
+        snprintf(line, sizeof(line), "RSSI:%d SNR:%.1f", st->last_rssi,
+                 (double)st->last_snr);
+    } else {
+        snprintf(line, sizeof(line), "READY ERR:%lu Q:%lu",
+                 (unsigned long)errors, (unsigned long)drops);
+    }
+    status_display_draw_text(4, 51, line);
+    status_display_flush();
+    s_lora_last_nodes = (uint16_t)st->node_count;
+}
+#endif
+
 static void status_display_render_locked(const char *line_one, const char *line_two) {
     // pages from the previous pass still hold content: re-flush them to erase
     s_dirty_pages |= s_drawn_pages;
@@ -343,12 +690,172 @@ static void status_display_idle_timer_cb(TimerHandle_t t) {
     }
 }
 
+/* Advance to the next status page: the compact LoRa page plus the idle
+ * animations on LoRa builds, or just the animation cycle otherwise. */
+static void status_display_button_cycle(void) {
+#ifdef CONFIG_HAS_LORA
+    s_lora_page = (uint8_t)((s_lora_page + 1) % 10);
+    if (s_lora_page > 0) {
+        settings_set_status_idle_animation(&G_Settings,
+                                           (IdleAnimation)(s_lora_page - 1));
+        settings_persist_setting(SETTING_IDLE_ANIMATION);
+    }
+    ESP_LOGI(TAG, "button: page %u/9 (%s)", (unsigned)s_lora_page,
+             s_lora_page == 0 ? "LoRa HUD" : "animation");
+#else
+    IdleAnimation cur = settings_get_status_idle_animation(&G_Settings);
+    IdleAnimation next = (IdleAnimation)(((int)cur + 1) % 9);
+    settings_set_status_idle_animation(&G_Settings, next);
+    settings_persist_setting(SETTING_IDLE_ANIMATION);
+#endif
+    s_last_update_tick = 0;
+    status_display_animations_reset();
+}
+
 static void status_display_anim_task(void *arg) {
     (void)arg;
+#if CONFIG_STATUS_DISPLAY_BUTTON_PIN >= 0
+    int btn_last = 1;
+    TickType_t btn_lockout = 0;
+#endif
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         TickType_t now = xTaskGetTickCount();
-        if (!status_idle_delay_elapsed(now)) {
+        // A held screen owns the panel: don't let the HUD/animations repaint
+        // over it (this is what made the BLE pairing PIN flicker away).
+        if (s_hold_display) continue;
+#ifdef CONFIG_HAS_LORA
+        lora_status_t lora_status;
+        memset(&lora_status, 0, sizeof(lora_status));
+        lora_manager_get_status(&lora_status);
+        /* Follow the selected backend, so starting MeshCore from the compact
+         * page is not reported as "LoRa off". */
+        bool mesh_running = status_display_mesh_running();
+        bool meshcore = status_display_meshcore_active();
+#ifdef CONFIG_HAS_MESHCORE
+        if (meshcore) {
+            /* Present the MeshCore radio through the same record the page
+             * draws. Region and hop limit have no MeshCore equivalent; the
+             * render switches those labels when meshcore is set. */
+            mc_status_t mc;
+            mc_manager_get_status(&mc);
+            lora_status.running = mc.running;
+            lora_status.radio_present = mc.radio_present;
+            lora_status.freq_hz = (uint32_t)(mc.freq_mhz * 1000000.0f + 0.5f);
+            lora_status.sf = mc.sf;
+            lora_status.bw_khz = (int)(mc.bw_khz + 0.5f);
+            lora_status.cr = mc.cr;
+            lora_status.tx_dbm = mc.tx_dbm;
+            lora_status.tx_ok = mc.tx_ok;
+            lora_status.tx_fail = mc.tx_fail;
+            lora_status.rx_ok = mc.rx_ok;
+            lora_status.rx_dups = mc.rx_dup;
+            lora_status.rx_crc_err = mc.rx_bad;
+            lora_status.last_rssi = mc.last_rssi;
+            lora_status.last_snr = mc.last_snr;
+            lora_status.node_count = mc.node_count;
+            lora_status.tx_relay = 0;
+            lora_status.q_drops = 0;
+            lora_status.duty_drops = 0;
+        }
+#endif
+        if (mesh_running && !s_lora_was_running) {
+            s_lora_page = 0;
+            s_last_lora_hud_tick = 0;
+        }
+        if (!mesh_running) {
+            /* Keep the selected page: the compact HUD stays reachable (and
+             * shows the start hint) while the radio is stopped. */
+            s_lora_preview_visible = false;
+            s_last_lora_hud_tick = 0;
+        }
+        s_lora_was_running = mesh_running;
+        /* Message previews only appear for traffic received while running. */
+        bool lora_preview_active = mesh_running &&
+                                   status_display_lora_preview_update(now);
+#endif
+#if CONFIG_STATUS_DISPLAY_BUTTON_PIN >= 0
+        // PRG: a single press cycles pages. On the compact LoRa page a double
+        // press toggles the radio, so the first press is held for the window
+        // before it is treated as a page step.
+        {
+            int lvl = gpio_get_level(CONFIG_STATUS_DISPLAY_BUTTON_PIN);
+            if (btn_last == 1 && lvl == 0 &&
+                (btn_lockout == 0 ||
+                 (now - btn_lockout) > LORA_HUD_BUTTON_DEBOUNCE_TICKS)) {
+                btn_lockout = now;
+#ifdef CONFIG_HAS_LORA
+                if (lora_preview_active) {
+                    s_lora_preview_visible = false;
+                    lora_preview_active = false;
+                    s_last_lora_hud_tick = 0;
+                    s_hud_press_armed = false;
+                    status_display_animations_reset();
+                    ESP_LOGI(TAG, "button: dismissed LoRa message preview");
+                } else if (s_lora_page == 0) {
+                    if (s_hud_press_armed &&
+                        (now - s_hud_press_tick) <= LORA_HUD_DOUBLE_PRESS_TICKS) {
+                        s_hud_press_armed = false;
+                        ESP_LOGI(TAG, "button: double press -> %s %s",
+                                 status_display_mesh_running() ? "stop" : "start",
+                                 status_display_meshcore_selected() ? "MeshCore" : "Meshtastic");
+                        status_display_toggle_radio();
+                        s_last_lora_hud_tick = 0;
+                    } else {
+                        s_hud_press_armed = true;
+                        s_hud_press_tick = now;
+                    }
+                } else {
+                    s_hud_press_armed = false;
+                    status_display_button_cycle();
+                }
+#else
+                status_display_button_cycle();
+#endif
+            }
+#ifdef CONFIG_HAS_LORA
+            /* No second press arrived in time: run the held page step. */
+            if (s_hud_press_armed && s_lora_page == 0 &&
+                (now - s_hud_press_tick) > LORA_HUD_DOUBLE_PRESS_TICKS) {
+                s_hud_press_armed = false;
+                status_display_button_cycle();
+            }
+#endif
+            btn_last = lvl;
+        }
+#endif
+#ifdef CONFIG_HAS_LORA
+        if (lora_preview_active) {
+            if (s_last_lora_hud_tick == 0 ||
+                now - s_last_lora_hud_tick >= pdMS_TO_TICKS(1000)) {
+                if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    status_display_render_lora_preview_locked();
+                    xSemaphoreGive(s_mutex);
+                    s_last_lora_hud_tick = now;
+                }
+            }
+            continue;
+        }
+        if (s_lora_page == 0) {
+            if (s_last_lora_hud_tick == 0 ||
+                now - s_last_lora_hud_tick >= pdMS_TO_TICKS(1000)) {
+                if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    status_display_render_lora_hud_locked(&lora_status, mesh_running,
+                                                          meshcore, now);
+                    xSemaphoreGive(s_mutex);
+                    s_last_lora_hud_tick = now;
+                }
+            }
+            continue;
+        }
+        s_last_lora_hud_tick = 0;
+#endif
+#ifdef CONFIG_HAS_LORA
+        bool lora_alt_page = s_lora_page != 0;
+#else
+        bool lora_alt_page = false;
+#endif
+        if (!lora_alt_page && !status_idle_delay_elapsed(now)) {
             status_display_animations_reset();
             continue;
         }
@@ -358,6 +865,9 @@ static void status_display_anim_task(void *arg) {
         s_anim_frame++;
 
         IdleAnimation anim = settings_get_status_idle_animation(&G_Settings);
+#ifdef CONFIG_HAS_LORA
+        if (lora_alt_page) anim = (IdleAnimation)(s_lora_page - 1);
+#endif
 
         if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             // pages from the previous pass still hold content: re-flush them to erase
@@ -396,6 +906,43 @@ static void status_display_sanitize(char *dst, size_t dst_len, const char *src) 
     dst[pos] = '\0';
 }
 
+static bool status_display_ensure_anim_task(void) {
+    if (s_anim_task != NULL) {
+        return true;
+    }
+    // LoRa builds keep the worker because it also owns the live radio HUD.
+#ifndef CONFIG_HAS_LORA
+    // Idle animation disabled -> no worker needed, ever. Saves 3k stack + TCB.
+    uint32_t timeout_ms = settings_get_status_idle_timeout_ms(&G_Settings);
+    if (timeout_ms == 0 || timeout_ms == UINT32_MAX) {
+        return false;
+    }
+#endif
+    s_next_anim_allowed_tick = 0;
+    s_anim_task_stack = heap_caps_malloc(STATUS_ANIM_TASK_STACK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_anim_task_tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_anim_task_stack && s_anim_task_tcb) {
+        s_anim_task = xTaskCreateStatic(status_display_anim_task, "status_anim",
+                                        STATUS_ANIM_TASK_STACK_BYTES, NULL,
+                                        tskIDLE_PRIORITY + 1,
+                                        s_anim_task_stack, s_anim_task_tcb);
+        if (s_anim_task) {
+            ESP_LOGI(TAG, "status animation task stack allocated from PSRAM: %d bytes", STATUS_ANIM_TASK_STACK_BYTES);
+            return true;
+        }
+    }
+    free(s_anim_task_stack);
+    free(s_anim_task_tcb);
+    s_anim_task_stack = NULL;
+    s_anim_task_tcb = NULL;
+    if (xTaskCreate(status_display_anim_task, "status_anim", STATUS_ANIM_TASK_STACK_BYTES,
+                    NULL, tskIDLE_PRIORITY + 1, &s_anim_task) == pdPASS) {
+        return true;
+    }
+    s_anim_task = NULL;
+    return false;
+}
+
 void status_display_init(void) {
     if (s_ready) return;
 
@@ -421,6 +968,15 @@ void status_display_init(void) {
     gpio_set_level(CONFIG_STATUS_DISPLAY_RESET_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
     ESP_LOGI(TAG, "reset pin %d sequence completed", CONFIG_STATUS_DISPLAY_RESET_PIN);
+#endif
+
+    // Animation-cycle button (e.g. Heltec V3 PRG): input with pullup,
+    // polled by the anim task. -1 disables.
+#if CONFIG_STATUS_DISPLAY_BUTTON_PIN >= 0
+    gpio_reset_pin(CONFIG_STATUS_DISPLAY_BUTTON_PIN);
+    gpio_set_direction(CONFIG_STATUS_DISPLAY_BUTTON_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(CONFIG_STATUS_DISPLAY_BUTTON_PIN, GPIO_PULLUP_ONLY);
+    ESP_LOGI(TAG, "animation button on pin %d", CONFIG_STATUS_DISPLAY_BUTTON_PIN);
 #endif
 
     if (!s_mutex) {
@@ -492,26 +1048,8 @@ void status_display_init(void) {
     if (s_idle_timer) {
         xTimerStart(s_idle_timer, 0);
     }
-    // create animation worker task
-    s_next_anim_allowed_tick = 0;
-    if (s_anim_task == NULL) {
-        s_anim_task_stack = heap_caps_malloc(STATUS_ANIM_TASK_STACK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        s_anim_task_tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (s_anim_task_stack && s_anim_task_tcb) {
-            s_anim_task = xTaskCreateStatic(status_display_anim_task, "status_anim",
-                                           STATUS_ANIM_TASK_STACK_BYTES, NULL,
-                                           tskIDLE_PRIORITY + 1,
-                                           s_anim_task_stack, s_anim_task_tcb);
-            ESP_LOGI(TAG, "status animation task stack allocated from PSRAM: %d bytes", STATUS_ANIM_TASK_STACK_BYTES);
-        } else {
-            free(s_anim_task_stack);
-            free(s_anim_task_tcb);
-            s_anim_task_stack = NULL;
-            s_anim_task_tcb = NULL;
-            xTaskCreate(status_display_anim_task, "status_anim", STATUS_ANIM_TASK_STACK_BYTES,
-                        NULL, tskIDLE_PRIORITY + 1, &s_anim_task);
-        }
-    }
+    // create animation worker task (lazy: skipped when idle timeout disabled)
+    (void)status_display_ensure_anim_task();
     ESP_LOGI(TAG, "status display ready");
 }
 
@@ -519,7 +1057,7 @@ bool status_display_is_ready(void) {
     return s_ready;
 }
 
-void status_display_set_lines(const char *line_one, const char *line_two) {
+static void status_display_render_lines(const char *line_one, const char *line_two) {
     if (!s_ready) {
         ESP_LOGW(TAG, "set_lines called while display not ready");
         return;
@@ -535,6 +1073,23 @@ void status_display_set_lines(const char *line_one, const char *line_two) {
     // reset idle timer
     s_last_update_tick = xTaskGetTickCount();
     status_display_animations_reset();
+    // late-create anim worker if idle animation was enabled after boot
+    (void)status_display_ensure_anim_task();
+}
+
+void status_display_set_lines(const char *line_one, const char *line_two) {
+    // A held screen takes priority over transient status messages.
+    if (s_hold_display) return;
+    status_display_render_lines(line_one, line_two);
+}
+
+void status_display_set_lines_hold(const char *line_one, const char *line_two) {
+    if (!s_ready) {
+        ESP_LOGW(TAG, "set_lines_hold called while display not ready");
+        return;
+    }
+    s_hold_display = true;
+    status_display_render_lines(line_one, line_two);
 }
 
 void status_display_show_attack(const char *attack_name, const char *target) {
@@ -562,8 +1117,10 @@ void status_display_show_status(const char *status_line) {
 }
 
 void status_display_clear(void) {
+    // Always release a held screen, even if the panel is not ready.
+    s_hold_display = false;
     if (!s_ready) return;
-    status_display_set_lines("", "");
+    status_display_render_lines("", "");
 }
 
 void status_display_deinit(void) {
@@ -573,6 +1130,7 @@ void status_display_deinit(void) {
     s_dirty_pages = 0xFF;
     status_display_flush();
     s_ready = false;
+    s_hold_display = false;
     if (s_idle_timer) {
         xTimerStop(s_idle_timer, 0);
         xTimerDelete(s_idle_timer, 0);
@@ -582,6 +1140,10 @@ void status_display_deinit(void) {
         vTaskDelete(s_anim_task);
         s_anim_task = NULL;
     }
+    heap_caps_free(s_anim_task_stack);
+    heap_caps_free(s_anim_task_tcb);
+    s_anim_task_stack = NULL;
+    s_anim_task_tcb = NULL;
     if (s_display_dev) {
         i2c_master_bus_rm_device(s_display_dev);
         s_display_dev = NULL;
@@ -625,6 +1187,11 @@ void status_display_set_lines(const char *a, const char *b)
     if (status_display_use_tdongle_lcd()) tdongle_status_set_lines(a, b);
 }
 
+void status_display_set_lines_hold(const char *a, const char *b)
+{
+    if (status_display_use_tdongle_lcd()) tdongle_status_set_lines(a, b);
+}
+
 void status_display_show_attack(const char *a, const char *b)
 {
     if (status_display_use_tdongle_lcd()) tdongle_status_show_attack(a, b);
@@ -643,5 +1210,3 @@ void status_display_clear(void)
 void status_display_deinit(void) {}
 
 #endif
-
-

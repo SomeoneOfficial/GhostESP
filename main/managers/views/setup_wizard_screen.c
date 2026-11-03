@@ -4,6 +4,8 @@
 #include "managers/settings_manager.h"
 #include "managers/display_manager.h"
 #include "gui/screen_layout.h"
+#include "gui/gui_router.h"
+#include "gui/theme_palette_api.h"
 #include "gui/accessibility_fonts.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -39,17 +41,15 @@ typedef enum {
 typedef struct {
     const char *code;
     const char *name;
-    uint8_t start_channel;
-    uint8_t num_channels;
 } WifiCountry;
 
 static const WifiCountry wifi_countries[] = {
-    {"US", "Americas", 1, 11},
-    {"GB", "Europe", 1, 13},
-    {"JP", "Japan", 1, 14},
-    {"AU", "Australia", 1, 13},
-    {"CN", "Asia", 1, 13},
-    {"01", "World Safe", 1, 11},
+    {"US", "Americas"},
+    {"GB", "Europe"},
+    {"JP", "Japan"},
+    {"AU", "Australia"},
+    {"CN", "Asia"},
+    {"01", "World Safe"},
 };
 #define COUNTRY_COUNT (sizeof(wifi_countries) / sizeof(wifi_countries[0]))
 
@@ -69,10 +69,13 @@ static lv_obj_t *welcome_skip_btn = NULL;
 
 static lv_obj_t *option_list = NULL;
 static int option_cursor = 0;
+static lv_obj_t *s_option_title_label = NULL;
+static lv_obj_t *s_option_hint_label = NULL;
 static bool wizard_exiting = false;
 static bool touch_started = false;
 static int touch_start_y = 0;
 static int touch_start_x = 0;
+static touch_drag_t s_touch_drag;
 static uint8_t temp_theme = 0;
 static uint8_t temp_menu_layout = 0;
 static uint8_t temp_terminal_color = 0;
@@ -86,27 +89,105 @@ static uint8_t temp_high_contrast = 0;
 static uint8_t temp_idle_animation = 0;
 #endif
 
-static const char *timezone_options[] = {
-    "UTC", "EST5EDT", "CST6CDT", "MST7MDT", "PST8PDT",
-    "GMT0", "CET-1CEST", "EET-2EEST", "IST-5:30", "JST-9",
-    "AEST-10AEDT", "AWST-8", "NZST-12NZDT"
+static uint8_t wizard_theme(void) {
+    if (current_step == SETUP_STEP_THEME && option_list &&
+        option_cursor >= 0 && option_cursor < THEME_PALETTE_THEME_COUNT) {
+        return (uint8_t)option_cursor;
+    }
+    return theme_palette_clamp_id(temp_theme);
+}
+
+static lv_color_t wizard_color(uint32_t color) {
+    return lv_color_hex(color);
+}
+
+/* Paints palette swatches directly onto the option button during DRAW_MAIN
+ * instead of creating child widgets (~51 fewer objects per list build;
+ * widget-based chips exhausted LVGL's heap on RAM-constrained boards). */
+static void wizard_theme_swatch_draw_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_DRAW_MAIN) return;
+    lv_obj_t *btn = lv_event_get_target(e);
+    int option_index = (int)(intptr_t)lv_event_get_user_data(e);
+    if (!btn || !lv_obj_is_valid(btn)) return;
+    if (option_index < 0 || option_index >= THEME_PALETTE_THEME_COUNT) return;
+    lv_draw_ctx_t *draw_ctx = lv_event_get_draw_ctx(e);
+    if (!draw_ctx || !draw_ctx->clip_area) return;
+
+    const theme_descriptor_t *theme = theme_palette_get_descriptor((uint8_t)option_index);
+    const uint32_t colors[3] = {theme->background, theme->accent, theme->text};
+
+    lv_area_t btn_area;
+    lv_obj_get_coords(btn, &btn_area);
+    lv_coord_t chip_w = 6;
+    lv_coord_t chip_h = LV_MIN(lv_area_get_height(&btn_area) / 3, 12);
+    if (chip_h < 5) return;
+    lv_coord_t y1 = lv_area_get_height(&btn_area) / 2 + btn_area.y1 - chip_h / 2;
+    lv_coord_t x2 = btn_area.x2 - 4;
+
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.bg_opa = LV_OPA_COVER;
+    dsc.border_width = 1;
+    dsc.border_opa = LV_OPA_COVER;
+    dsc.border_color = lv_color_hex(theme->border);
+    dsc.radius = 1;
+
+    for (int i = 2; i >= 0; --i) {
+        dsc.bg_color = lv_color_hex(colors[i]);
+        lv_area_t chip = {(lv_coord_t)(x2 - chip_w), y1, x2, (lv_coord_t)(y1 + chip_h - 1)};
+        lv_draw_rect(draw_ctx, &dsc, &chip);
+        x2 -= chip_w;
+    }
+}
+
+// const-qualified and kept in flash; labels/order MUST match options_screen.c.
+static const char * const timezone_options[] = {
+    "UTC", "EST", "CST", "MST", "PST",
+    "GMT/BST (UK)", "CET", "EET", "IST (India)", "JST",
+    "AEST", "AWST", "NZST",
+    // North America
+    "HST (Hawaii)", "AKST (Alaska)", "AST (Atlantic)", "MEX (Mexico)",
+    // South America
+    "BRT (Brasilia)", "ART (Argentina)", "CLT (Chile)", "COT (Colombia)", "PET (Peru)", "VET (Venezuela)",
+    // Europe & Africa
+    "WET (Portugal)", "MSK (Moscow)", "TRT (Turkey)",
+    "WAT (W.Africa)", "CAT (C.Africa)", "EAT (E.Africa)", "SAST (S.Africa)",
+    // Middle East & Asia
+    "GST (Gulf)", "IRST (Iran)", "PKT (Pakistan)", "AFT (Afghanistan)", "NPT (Nepal)", "BST (Bangladesh)",
+    "ICT (Indochina)", "WIB (Indonesia)", "SGT (Singapore)", "HKT (HongKong)", "CST (China)",
+    "PHT (Philippines)", "MYT (Malaysia)", "KST (Korea)", "MMT (Myanmar)",
+    // Oceania
+    "ACST (Adelaide)", "ChST (Chamorro)"
 };
-static const char *timezone_values[] = {
+static const char * const timezone_values[] = {
     "UTC0", "EST5EDT,M3.2.0,M11.1.0", "CST6CDT,M3.2.0,M11.1.0", "MST7MDT,M3.2.0,M11.1.0", "PST8PDT,M3.2.0,M11.1.0",
-    "GMT0", "CET-1CEST,M3.5.0,M10.5.0", "EET-2EEST,M3.5.0,M10.5.0", "IST-5:30", "JST-9",
-    "AEST-10AEDT,M10.1.0,M4.1.0", "AWST-8", "NZST-12NZDT,M9.5.0,M4.1.0"
+    "GMT0BST,M3.5.0/1,M10.5.0", "CET-1CEST,M3.5.0,M10.5.0", "EET-2EEST,M3.5.0,M10.5.0", "IST-5:30", "JST-9",
+    "AEST-10AEDT,M10.1.0,M4.1.0", "AWST-8", "NZST-12NZDT,M9.5.0,M4.1.0",
+    // North America
+    "HST10", "AKST9AKDT,M3.2.0,M11.1.0", "AST4ADT,M3.2.0,M11.1.0", "CST6",
+    // South America
+    "BRT3", "ART3", "CLT4CLST,M9.1.0,M4.1.0", "COT5", "PET5", "VET4",
+    // Europe & Africa
+    "WET0WEST,M3.5.0,M10.5.0", "MSK-3", "TRT-3",
+    "WAT-1", "CAT-2", "EAT-3", "SAST-2",
+    // Middle East & Asia
+    "GST-4", "IRST-3:30", "PKT-5", "AFT-4:30", "NPT-5:45", "BST-6",
+    "ICT-7", "WIB-7", "SGT-8", "HKT-8", "CST-8",
+    "PHT-8", "MYT-8", "KST-9", "MMT-6:30",
+    // Oceania
+    "ACST-9:30", "ChST-10"
 };
-#define TIMEZONE_COUNT 13
+#define TIMEZONE_COUNT ((int)(sizeof(timezone_values) / sizeof(timezone_values[0])))
 
 static const char *display_timeout_options[] = {"5s", "10s", "30s", "60s", "Never"};
 static const uint32_t display_timeout_values[] = {5000, 10000, 30000, 60000, UINT32_MAX};
 #define DISPLAY_TIMEOUT_COUNT 5
 
-static const char *theme_options[] = {"OG", "Pastel", "Dark", "Bright", "Solarized", "Monochrome", "Rose Red", "Purple", "Blue", "Orange", "Neon", "Cyberpunk", "Ocean", "Sunset", "Forest", "Cherry Blossom", "Soft Sand"};
-#define THEME_COUNT 17
+static const char *theme_options[THEME_PALETTE_THEME_COUNT];
+#define THEME_COUNT THEME_PALETTE_THEME_COUNT
 
-static const char *menu_layout_options[] = {"Carousel", "Grid", "List"};
-#define MENU_LAYOUT_COUNT 3
+static const char *menu_layout_options[] = {"Carousel", "Grid", "List", "Compact", "Hero"};
+#define MENU_LAYOUT_COUNT 5
 
 static const char *terminal_color_options[] = {"Green", "White", "Red", "Blue", "Yellow", "Cyan", "Magenta", "Orange"};
 static const uint32_t terminal_color_values[] = {0x00FF00, 0xFFFFFF, 0xFF0000, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFA500};
@@ -137,10 +218,69 @@ static void show_country_screen(void);
 static void show_complete_screen(void);
 static void finish_setup(void);
 static void skip_setup(void);
+static void wizard_row_set_selected(lv_obj_t *row, bool selected, uint8_t theme_id);
 
-#define STATUS_BAR_H 18
+/* Every step is drawn by setup_wizard_create(), so moving between steps means
+ * rebuilding the wizard itself. Switching to setup_wizard_view again would be
+ * dropped as a duplicate route (see gui_router_navigate_immediate), leaving the
+ * wizard stuck on the step it is already showing, so refresh in place. */
+static void wizard_goto_step(SetupStep step) {
+    current_step = step;
+    gui_router_refresh();
+}
+
+/* The wizard draws a real status bar (its root is created with a title), so
+ * reserve the space that one actually occupies instead of an older 18px guess
+ * that let the title slide under it on the small panels. */
+#define STATUS_BAR_H GUI_STATUS_BAR_H
 #define USABLE_H (LV_VER_RES - STATUS_BAR_H)
 #define USABLE_W LV_HOR_RES
+
+/* ---------------------------------------------------------------------------
+ * Row-list geometry
+ *
+ * The country picker and every option list (theme, timezone, layout, ...) share
+ * one source so their row rhythm is identical. A row hugs its label: the floor
+ * is one line of the row font plus a 2px margin, because a fixed 22px floor
+ * wrapped an 11px label in a third of padding on the 240x135 panels, which read
+ * as a column of empty space and left only three rows of a six-row list on
+ * screen. The proportional term and the ceiling are unchanged, so touch panels
+ * keep their finger-sized rows.
+ * ------------------------------------------------------------------------ */
+typedef struct {
+    int title_y;
+    int list_y;
+    int list_h;
+    int row_h;
+    int pad_h;      /* list inset, left/right */
+    int pad_v;      /* list inset, top/bottom */
+    int hint_gap;   /* distance from the screen bottom to the hint label */
+} wizard_rows_t;
+
+static void wizard_row_metrics(wizard_rows_t *m, const lv_font_t *row_font) {
+    m->title_y = STATUS_BAR_H + (USABLE_H * 3 / 100);
+    m->list_y = STATUS_BAR_H + (USABLE_H * 15 / 100);
+    m->list_h = USABLE_H * 70 / 100;
+    m->hint_gap = GUI_HOME_SAFE_H + (USABLE_H * 3 / 100);
+    if (m->hint_gap < GUI_HOME_SAFE_H + 3) m->hint_gap = GUI_HOME_SAFE_H + 3;
+
+    m->pad_h = USABLE_W * 2 / 100;
+    if (m->pad_h < 3) m->pad_h = 3;
+    /* Vertical insets only clip the visible rows, so keep them tight; the rows
+     * already carry their own breathing room. */
+    m->pad_v = GUI_GRID / 2;
+    if (m->pad_v < 2) m->pad_v = 2;
+
+    /* One line of the row font plus a 2px margin above and below, never less. */
+    int margin = GUI_GRID / 2;
+    if (margin < 2) margin = 2;
+    int row_min = lv_font_get_line_height(row_font) + 2 * margin;
+    int row_h = USABLE_H * 12 / 100;
+    if (row_h < row_min) row_h = row_min;
+    if (row_h > 36) row_h = 36;
+    if (row_h < 14) row_h = 14;
+    m->row_h = row_h;
+}
 
 static void style_wizard_btn(lv_obj_t *btn, lv_color_t bg, lv_coord_t radius) {
     lv_obj_set_style_bg_color(btn, bg, LV_PART_MAIN);
@@ -245,16 +385,21 @@ static void update_welcome_btn_focus(void) {
     if (welcome_start_btn && welcome_skip_btn) {
         lv_obj_t *start_label = lv_obj_get_child(welcome_start_btn, 0);
         lv_obj_t *skip_label = lv_obj_get_child(welcome_skip_btn, 0);
+        uint8_t theme = wizard_theme();
+        lv_color_t accent = wizard_color(theme_palette_get_accent(theme));
+        lv_color_t on_accent = wizard_color(theme_palette_get_on_accent(theme));
+        lv_color_t surface = wizard_color(theme_palette_get_surface_alt(theme));
+        lv_color_t text = wizard_color(theme_palette_get_text(theme));
         if (welcome_btn_focus == 0) {
-            lv_obj_set_style_bg_color(welcome_start_btn, lv_color_hex(0xFFFFFF), 0);
-            if (start_label) lv_obj_set_style_text_color(start_label, lv_color_hex(0x000000), 0);
-            lv_obj_set_style_bg_color(welcome_skip_btn, lv_color_hex(0x333333), 0);
-            if (skip_label) lv_obj_set_style_text_color(skip_label, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_bg_color(welcome_start_btn, accent, 0);
+            if (start_label) lv_obj_set_style_text_color(start_label, on_accent, 0);
+            lv_obj_set_style_bg_color(welcome_skip_btn, surface, 0);
+            if (skip_label) lv_obj_set_style_text_color(skip_label, text, 0);
         } else {
-            lv_obj_set_style_bg_color(welcome_start_btn, lv_color_hex(0x333333), 0);
-            if (start_label) lv_obj_set_style_text_color(start_label, lv_color_hex(0xFFFFFF), 0);
-            lv_obj_set_style_bg_color(welcome_skip_btn, lv_color_hex(0xFFFFFF), 0);
-            if (skip_label) lv_obj_set_style_text_color(skip_label, lv_color_hex(0x000000), 0);
+            lv_obj_set_style_bg_color(welcome_start_btn, surface, 0);
+            if (start_label) lv_obj_set_style_text_color(start_label, text, 0);
+            lv_obj_set_style_bg_color(welcome_skip_btn, accent, 0);
+            if (skip_label) lv_obj_set_style_text_color(skip_label, on_accent, 0);
         }
     }
 }
@@ -286,7 +431,7 @@ static void show_welcome_screen(void) {
     
     lv_obj_t *title = lv_label_create(root);
     lv_label_set_text(title, "Welcome to GhostESP!");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(title, wizard_color(theme_palette_get_text(wizard_theme())), 0);
     lv_obj_set_style_text_font(title, title_font, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, title_y);
 
@@ -297,7 +442,7 @@ static void show_welcome_screen(void) {
         "Save your home WiFi\n"
         "Set your region\n"
         "Customize device appearance");
-    lv_obj_set_style_text_color(desc, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_color(desc, wizard_color(theme_palette_get_text_muted(wizard_theme())), 0);
     lv_obj_set_style_text_font(desc, body_font, 0);
     lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(desc, USABLE_W - 20);
@@ -318,7 +463,7 @@ static void show_welcome_screen(void) {
     gui_apply_pressed_style(welcome_start_btn);
     lv_obj_set_size(welcome_start_btn, btn_w, btn_h);
     lv_obj_align(welcome_start_btn, LV_ALIGN_TOP_MID, -btn_offset, btn_y);
-    style_wizard_btn(welcome_start_btn, lv_color_hex(0x333333), 5);
+    style_wizard_btn(welcome_start_btn, wizard_color(theme_palette_get_surface_alt(wizard_theme())), 5);
     lv_obj_t *start_label = lv_label_create(welcome_start_btn);
     lv_label_set_text(start_label, "Start");
     lv_obj_center(start_label);
@@ -328,7 +473,7 @@ static void show_welcome_screen(void) {
     gui_apply_pressed_style(welcome_skip_btn);
     lv_obj_set_size(welcome_skip_btn, btn_w, btn_h);
     lv_obj_align(welcome_skip_btn, LV_ALIGN_TOP_MID, btn_offset, btn_y);
-    style_wizard_btn(welcome_skip_btn, lv_color_hex(0x333333), 5);
+    style_wizard_btn(welcome_skip_btn, wizard_color(theme_palette_get_surface_alt(wizard_theme())), 5);
     lv_obj_t *skip_label = lv_label_create(welcome_skip_btn);
     lv_label_set_text(skip_label, "Skip");
     lv_obj_center(skip_label);
@@ -340,28 +485,50 @@ static void show_welcome_screen(void) {
 static void country_btn_event_cb(lv_event_t *e) {
     intptr_t index = (intptr_t)lv_event_get_user_data(e);
     selected_country_index = (int)index;
-    current_step = SETUP_STEP_TIMEZONE;
-    display_manager_switch_view(&setup_wizard_view);
+    wizard_goto_step(SETUP_STEP_TIMEZONE);
 }
 
 static void timezone_btn_event_cb(lv_event_t *e) {
     (void)e;
-    current_step = SETUP_STEP_DISPLAY_TIMEOUT;
-    display_manager_switch_view(&setup_wizard_view);
+    wizard_goto_step(SETUP_STEP_DISPLAY_TIMEOUT);
 }
 
 static void update_option_selection(int count) {
+    (void)count;
     if (!option_list) return;
+    uint8_t active_theme = wizard_theme();
+    if (current_step == SETUP_STEP_THEME) {
+        uint8_t preview = theme_palette_clamp_id((uint8_t)option_cursor);
+        lv_color_t preview_bg = wizard_color(theme_palette_get_background(preview));
+        lv_obj_set_style_bg_color(root, preview_bg, 0);
+        gui_screen_apply_theme_background_for(root, preview);
+        display_manager_update_status_bar_color();
+        if (s_option_title_label && lv_obj_is_valid(s_option_title_label)) {
+            lv_obj_set_style_text_color(s_option_title_label,
+                                        wizard_color(theme_palette_get_text(preview)), 0);
+        }
+        if (s_option_hint_label && lv_obj_is_valid(s_option_hint_label)) {
+            lv_obj_set_style_text_color(s_option_hint_label,
+                                        wizard_color(theme_palette_get_text_muted(preview)), 0);
+        }
+    }
     uint32_t child_count = lv_obj_get_child_cnt(option_list);
-    for (uint32_t i = 0; i < child_count && (int)i < count; i++) {
-        lv_obj_t *btn = lv_obj_get_child(option_list, i);
-        lv_obj_t *label = lv_obj_get_child(btn, 0);
-        if ((int)i == option_cursor) {
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0xFFFFFF), 0);
-            if (label) lv_obj_set_style_text_color(label, lv_color_hex(0x000000), 0);
+    for (uint32_t i = 0; i < child_count; i++) {
+        lv_obj_t *row = lv_obj_get_child(option_list, i);
+        if (!row) continue;
+        int idx = (int)(intptr_t)lv_obj_get_user_data(row);
+        bool selected = ((int)i == option_cursor);
+        if (current_step == SETUP_STEP_THEME && idx >= 0) {
+            uint8_t row_theme = (uint8_t)idx;
+            if (selected) {
+                lv_obj_set_style_bg_color(row, wizard_color(theme_palette_get_accent(row_theme)), 0);
+                lv_obj_set_style_text_color(row, wizard_color(theme_palette_get_on_accent(row_theme)), 0);
+            } else {
+                lv_obj_set_style_bg_color(row, wizard_color(theme_palette_get_surface(row_theme)), 0);
+                lv_obj_set_style_text_color(row, wizard_color(theme_palette_get_text(row_theme)), 0);
+            }
         } else {
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0x333333), 0);
-            if (label) lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+            wizard_row_set_selected(row, selected, active_theme);
         }
     }
     lv_obj_t *selected_btn = lv_obj_get_child(option_list, option_cursor);
@@ -370,85 +537,258 @@ static void update_option_selection(int count) {
     }
 }
 
-static void show_option_screen(const char *title_text, const char **options, int count, int current_value) {
+/* ---------------------------------------------------------------------------
+ * RAM-efficient list rows
+ *
+ * A long option list used to cost, per row, one lv_btn + one child lv_label +
+ * a per-object pressed local style + several per-object geometry props. Once
+ * enough regions were added that exhausted the 24 KB LVGL pool on CYD builds,
+ * LV_ASSERT_MALLOC (LV_ASSERT_HANDLER = while(1)) spun forever in the LVGL tick
+ * task and tripped the task watchdog. Rows are now a single clickable label
+ * that shares one geometry/pressed style, leaving only a two-property colour
+ * override per row.
+ * ------------------------------------------------------------------------ */
+static lv_style_t s_row_style;
+static lv_style_t s_row_pressed_style;
+static lv_color_filter_dsc_t s_row_pressed_filter;
+static bool s_row_styles_ready = false;
+static bool s_row_pressed_ready = false;
+
+static void wizard_row_styles_init(int w, int h, const lv_font_t *font) {
+    if (s_row_styles_ready) {
+        lv_style_reset(&s_row_style);
+    }
+    lv_style_init(&s_row_style);
+    lv_style_set_width(&s_row_style, w);
+    lv_style_set_height(&s_row_style, h);
+    lv_style_set_radius(&s_row_style, 4);
+    lv_style_set_border_width(&s_row_style, 0);
+    lv_style_set_shadow_width(&s_row_style, 0);
+    lv_style_set_bg_opa(&s_row_style, LV_OPA_COVER);
+    uint8_t base_theme = wizard_theme();
+    lv_style_set_bg_color(&s_row_style, wizard_color(theme_palette_get_surface(base_theme)));
+    lv_style_set_text_color(&s_row_style, wizard_color(theme_palette_get_text(base_theme)));
+    lv_style_set_text_font(&s_row_style, font);
+    lv_style_set_text_align(&s_row_style, LV_TEXT_ALIGN_CENTER);
+    lv_coord_t line_h = lv_font_get_line_height(font);
+    lv_coord_t pad_v = (h - line_h) / 2;
+    if (pad_v < 0) pad_v = 0;
+    lv_style_set_pad_top(&s_row_style, pad_v);
+    lv_style_set_pad_bottom(&s_row_style, 0);
+    lv_style_set_pad_left(&s_row_style, 4);
+    lv_style_set_pad_right(&s_row_style, 4);
+
+    if (!s_row_pressed_ready) {
+        lv_color_filter_dsc_init(&s_row_pressed_filter, gui_pressed_dark_filter_cb);
+        lv_style_init(&s_row_pressed_style);
+        lv_style_set_color_filter_dsc(&s_row_pressed_style, &s_row_pressed_filter);
+        lv_style_set_color_filter_opa(&s_row_pressed_style, 35);
+        s_row_pressed_ready = true;
+    }
+    s_row_styles_ready = true;
+}
+
+static lv_obj_t *wizard_create_row(lv_obj_t *parent, const char *text) {
+    lv_obj_t *row = lv_label_create(parent);
+    lv_label_set_text(row, text);
+    lv_obj_add_style(row, &s_row_style, LV_PART_MAIN);
+    lv_obj_add_style(row, &s_row_pressed_style, LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    return row;
+}
+
+/* Only the selected row carries a local style; deselecting removes it, so a
+ * long list costs one object per row with no per-row style allocation. */
+static void wizard_row_set_selected(lv_obj_t *row, bool selected, uint8_t theme_id) {
+    if (!row) return;
+    if (selected) {
+        lv_obj_set_style_bg_color(row, wizard_color(theme_palette_get_accent(theme_id)), 0);
+        lv_obj_set_style_text_color(row, wizard_color(theme_palette_get_on_accent(theme_id)), 0);
+    } else {
+        lv_obj_remove_local_style_prop(row, LV_STYLE_BG_COLOR, LV_PART_MAIN);
+        lv_obj_remove_local_style_prop(row, LV_STYLE_TEXT_COLOR, LV_PART_MAIN);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Option-list pagination
+ *
+ * Long option lists are shown one page at a time with "< Prev" / "Next >" rows,
+ * matching the other paged menus, so only a page of rows ever lives in the LVGL
+ * pool. The theme step stays unpaged: its cursor index doubles as the palette
+ * preview index (see wizard_theme()). Row object user_data carries the global
+ * option index, or -1/-2 for the prev/next rows.
+ * ------------------------------------------------------------------------ */
+#define WIZARD_PAGE_SIZE 8
+
+static int s_opt_page_offset = 0;
+static int s_opt_page_size = WIZARD_PAGE_SIZE;
+static int s_opt_total = 0;
+static const char * const *s_opt_labels = NULL;
+static bool s_opt_has_prev = false;
+static bool s_opt_has_next = false;
+
+static void wizard_populate_option_page(int offset) {
+    if (!option_list || s_opt_total <= 0 || !s_opt_labels) return;
+
+    int page = s_opt_page_size > 0 ? s_opt_page_size : WIZARD_PAGE_SIZE;
+    if (offset < 0) offset = 0;
+    if (offset >= s_opt_total) offset = ((s_opt_total - 1) / page) * page;
+
+    s_opt_page_offset = offset;
+    int remaining = s_opt_total - offset;
+    int page_options = remaining > page ? page : remaining;
+    if (page_options < 0) page_options = 0;
+    s_opt_has_prev = offset > 0;
+    s_opt_has_next = (offset + page_options) < s_opt_total;
+
+    lv_obj_clean(option_list);
+
+    bool is_theme = (current_step == SETUP_STEP_THEME);
+    for (int i = 0; i < page_options; i++) {
+        int idx = offset + i;
+        lv_obj_t *row = wizard_create_row(option_list, s_opt_labels[idx]);
+        lv_obj_set_user_data(row, (void *)(intptr_t)idx);
+        if (is_theme) {
+            uint8_t row_theme = (uint8_t)idx;
+            lv_obj_set_style_bg_color(row, wizard_color(theme_palette_get_surface(row_theme)), 0);
+            lv_obj_set_style_text_color(row, wizard_color(theme_palette_get_text(row_theme)), 0);
+            lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_LEFT, 0);
+            lv_obj_add_event_cb(row, wizard_theme_swatch_draw_cb, LV_EVENT_DRAW_MAIN,
+                                (void *)(intptr_t)idx);
+        }
+    }
+    if (s_opt_has_prev) {
+        lv_obj_t *row = wizard_create_row(option_list, "< Prev");
+        lv_obj_set_user_data(row, (void *)(intptr_t)-1);
+    }
+    if (s_opt_has_next) {
+        lv_obj_t *row = wizard_create_row(option_list, "Next >");
+        lv_obj_set_user_data(row, (void *)(intptr_t)-2);
+    }
+}
+
+/* Global option index under the cursor, or -1/-2 for a page row, -3 if none. */
+static int wizard_option_cursor_tag(void) {
+    if (!option_list) return -3;
+    lv_obj_t *row = lv_obj_get_child(option_list, option_cursor);
+    if (!row) return -3;
+    return (int)(intptr_t)lv_obj_get_user_data(row);
+}
+
+static bool wizard_option_page_step(int dir) {
+    if (!option_list) return false;
+    int new_offset = s_opt_page_offset + dir * s_opt_page_size;
+    if (new_offset < 0 || new_offset >= s_opt_total) return false;
+    wizard_populate_option_page(new_offset);
+    option_cursor = 0;
+    update_option_selection(s_opt_total);
+    return true;
+}
+
+/* If the cursor sits on a page row, change page and return true. */
+static bool wizard_option_handle_paging(void) {
+    int tag = wizard_option_cursor_tag();
+    if (tag == -1) return wizard_option_page_step(-1);
+    if (tag == -2) return wizard_option_page_step(1);
+    return false;
+}
+
+static void wizard_option_apply_choice(int index) {
+    if (index < 0) return;
+    if (current_step == SETUP_STEP_TIMEZONE) temp_timezone = index;
+    else if (current_step == SETUP_STEP_DISPLAY_TIMEOUT) temp_display_timeout = index;
+    else if (current_step == SETUP_STEP_THEME) temp_theme = index;
+    else if (current_step == SETUP_STEP_MENU_LAYOUT) temp_menu_layout = index;
+    else if (current_step == SETUP_STEP_TERMINAL_COLOR) temp_terminal_color = index;
+    else if (current_step == SETUP_STEP_EPILEPSY_WARNING) temp_epilepsy_warning = index;
+    else if (current_step == SETUP_STEP_ACCESSIBILITY) temp_font_size = index;
+#ifdef CONFIG_WITH_STATUS_DISPLAY
+    else if (current_step == SETUP_STEP_IDLE_ANIMATION) temp_idle_animation = index;
+#endif
+}
+
+/* List container that touch drag should scroll for the current step. */
+static lv_obj_t *wizard_scroll_target(void) {
+    if (current_step == SETUP_STEP_COUNTRY && country_list) return country_list;
+    if (option_list) return option_list;
+    return NULL;
+}
+
+static void show_option_screen(const char *title_text, const char * const *options, int count, int current_value) {
     const lv_font_t *title_font = get_title_font();
     const lv_font_t *body_font = get_body_font();
-    
-    int title_y = STATUS_BAR_H + (USABLE_H * 3 / 100);
-    int list_top = STATUS_BAR_H + (USABLE_H * 15 / 100);
-    int list_height = USABLE_H * 70 / 100;
-    int btn_h = USABLE_H * 12 / 100;
-    if (btn_h < 22) btn_h = 22;
-    if (btn_h > 36) btn_h = 36;
-    int hint_bottom = USABLE_H * 3 / 100;
-    if (hint_bottom < 3) hint_bottom = 3;
-    
+
+    wizard_rows_t rows;
+    wizard_row_metrics(&rows, body_font);
+
     lv_obj_t *title = lv_label_create(root);
     lv_label_set_text(title, title_text);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    s_option_title_label = title;
+    lv_obj_set_style_text_color(title, wizard_color(theme_palette_get_text(wizard_theme())), 0);
     lv_obj_set_style_text_font(title, title_font, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, title_y);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, rows.title_y);
 
-    int list_pad = USABLE_W * 2 / 100;
-    if (list_pad < 3) list_pad = 3;
     option_list = lv_obj_create(root);
-    lv_obj_set_size(option_list, USABLE_W - list_pad * 2, list_height);
-    lv_obj_align(option_list, LV_ALIGN_TOP_MID, 0, list_top);
+    lv_obj_set_size(option_list, USABLE_W - rows.pad_h * 2, rows.list_h);
+    lv_obj_align(option_list, LV_ALIGN_TOP_MID, 0, rows.list_y);
     lv_obj_set_style_bg_opa(option_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(option_list, 0, 0);
     lv_obj_set_style_shadow_width(option_list, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(option_list, list_pad, 0);
+    lv_obj_set_style_pad_hor(option_list, rows.pad_h, 0);
+    lv_obj_set_style_pad_ver(option_list, rows.pad_v, 0);
+    /* Plain objects inherit the theme card's 10px row gap, which reads as a
+     * column of empty space between the short rows on the small panels. */
+    lv_obj_set_style_pad_row(option_list, GUI_GRID / 2, 0);
+    lv_obj_set_style_pad_column(option_list, 0, 0);
     lv_obj_set_flex_flow(option_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(option_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    int item_w = get_card_width(list_pad);
-    
-    for (int i = 0; i < count; i++) {
-        lv_obj_t *btn = lv_btn_create(option_list);
-        gui_apply_pressed_style(btn);
-        lv_obj_set_size(btn, item_w, btn_h);
-        style_wizard_btn(btn, lv_color_hex(0x333333), 4);
-        
-        lv_obj_t *label = lv_label_create(btn);
-        lv_label_set_text(label, options[i]);
-        lv_obj_set_style_text_font(label, body_font, 0);
-        lv_obj_center(label);
-    }
+    int item_w = get_card_width(rows.pad_h);
 
-    option_cursor = current_value;
-    if (option_cursor >= count) option_cursor = 0;
+    wizard_row_styles_init(item_w, rows.row_h, body_font);
+    s_opt_labels = options;
+    s_opt_total = count;
+    /* The theme list must stay whole: its cursor index is the preview index. */
+    s_opt_page_size = (current_step == SETUP_STEP_THEME) ? (count > 0 ? count : 1)
+                                                         : WIZARD_PAGE_SIZE;
+    int initial_offset = 0;
+    if (current_value > 0) {
+        initial_offset = (current_value / s_opt_page_size) * s_opt_page_size;
+    }
+    wizard_populate_option_page(initial_offset);
+
+    option_cursor = current_value - s_opt_page_offset;
+    if (option_cursor < 0 || option_cursor >= (int)lv_obj_get_child_cnt(option_list)) {
+        option_cursor = 0;
+    }
     update_option_selection(count);
 
     lv_obj_t *hint = lv_label_create(root);
+    s_option_hint_label = hint;
 #ifdef CONFIG_USE_TOUCHSCREEN
     lv_label_set_text(hint, "Tap to select");
 #else
     lv_label_set_text(hint, LV_SYMBOL_UP LV_SYMBOL_DOWN " OK");
 #endif
-    lv_obj_set_style_text_color(hint, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_color(hint, wizard_color(theme_palette_get_text_muted(wizard_theme())), 0);
     lv_obj_set_style_text_font(hint, body_font, 0);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -hint_bottom);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -rows.hint_gap);
 }
 
 static int prev_country_cursor = -1;
 static void update_country_selection(void) {
     if (!country_list) return;
     
+    uint8_t theme = wizard_theme();
     if (prev_country_cursor >= 0 && prev_country_cursor != country_cursor) {
-        lv_obj_t *old_btn = lv_obj_get_child(country_list, prev_country_cursor);
-        if (old_btn) {
-            lv_obj_set_style_bg_color(old_btn, lv_color_hex(0x333333), 0);
-            lv_obj_t *old_label = lv_obj_get_child(old_btn, 0);
-            if (old_label) lv_obj_set_style_text_color(old_label, lv_color_hex(0xFFFFFF), 0);
-        }
+        wizard_row_set_selected(lv_obj_get_child(country_list, prev_country_cursor), false, theme);
     }
     
-    lv_obj_t *new_btn = lv_obj_get_child(country_list, country_cursor);
-    if (new_btn) {
-        lv_obj_set_style_bg_color(new_btn, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_t *new_label = lv_obj_get_child(new_btn, 0);
-        if (new_label) lv_obj_set_style_text_color(new_label, lv_color_hex(0x000000), 0);
-        lv_obj_scroll_to_view(new_btn, LV_ANIM_OFF);
+    lv_obj_t *new_row = lv_obj_get_child(country_list, country_cursor);
+    if (new_row) {
+        wizard_row_set_selected(new_row, true, theme);
+        lv_obj_scroll_to_view(new_row, LV_ANIM_OFF);
     }
     
     prev_country_cursor = country_cursor;
@@ -457,48 +797,37 @@ static void update_country_selection(void) {
 static void show_country_screen(void) {
     const lv_font_t *title_font = get_title_font();
     const lv_font_t *body_font = get_body_font();
-    
-    int title_y = STATUS_BAR_H + (USABLE_H * 3 / 100);
-    int list_top = STATUS_BAR_H + (USABLE_H * 15 / 100);
-    int list_height = USABLE_H * 70 / 100;
-    int btn_h = USABLE_H * 12 / 100;
-    if (btn_h < 22) btn_h = 22;
-    if (btn_h > 36) btn_h = 36;
-    int hint_bottom = USABLE_H * 3 / 100;
-    if (hint_bottom < 3) hint_bottom = 3;
-    
+
+    wizard_rows_t rows;
+    wizard_row_metrics(&rows, body_font);
+
     lv_obj_t *title = lv_label_create(root);
     lv_label_set_text(title, "Select Region");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(title, wizard_color(theme_palette_get_text(wizard_theme())), 0);
     lv_obj_set_style_text_font(title, title_font, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, title_y);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, rows.title_y);
 
-    int list_pad = USABLE_W * 2 / 100;
-    if (list_pad < 3) list_pad = 3;
     country_list = lv_obj_create(root);
-    lv_obj_set_size(country_list, USABLE_W - list_pad * 2, list_height);
-    lv_obj_align(country_list, LV_ALIGN_TOP_MID, 0, list_top);
+    lv_obj_set_size(country_list, USABLE_W - rows.pad_h * 2, rows.list_h);
+    lv_obj_align(country_list, LV_ALIGN_TOP_MID, 0, rows.list_y);
     lv_obj_set_style_bg_opa(country_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(country_list, 0, 0);
     lv_obj_set_style_shadow_width(country_list, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(country_list, list_pad, 0);
+    lv_obj_set_style_pad_hor(country_list, rows.pad_h, 0);
+    lv_obj_set_style_pad_ver(country_list, rows.pad_v, 0);
+    /* Plain objects inherit the theme card's 10px row gap, which reads as a
+     * column of empty space between the short rows on the small panels. */
+    lv_obj_set_style_pad_row(country_list, GUI_GRID / 2, 0);
+    lv_obj_set_style_pad_column(country_list, 0, 0);
     lv_obj_set_flex_flow(country_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(country_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    int item_w = get_card_width(list_pad);
-    
+    int item_w = get_card_width(rows.pad_h);
+
+    wizard_row_styles_init(item_w, rows.row_h, body_font);
     for (int i = 0; i < (int)COUNTRY_COUNT; i++) {
-        lv_obj_t *btn = lv_btn_create(country_list);
-        gui_apply_pressed_style(btn);
-        lv_obj_set_size(btn, item_w, btn_h);
-        style_wizard_btn(btn, lv_color_hex(0x333333), 4);
-
-        lv_obj_t *label = lv_label_create(btn);
-        lv_label_set_text(label, wifi_countries[i].name);
-        lv_obj_set_style_text_font(label, body_font, 0);
-        lv_obj_center(label);
-
-        lv_obj_add_event_cb(btn, country_btn_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_t *row = wizard_create_row(country_list, wifi_countries[i].name);
+        lv_obj_add_event_cb(row, country_btn_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
     }
 
     country_cursor = selected_country_index;
@@ -511,9 +840,9 @@ static void show_country_screen(void) {
 #else
     lv_label_set_text(hint, LV_SYMBOL_UP LV_SYMBOL_DOWN " OK");
 #endif
-    lv_obj_set_style_text_color(hint, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_color(hint, wizard_color(theme_palette_get_text_muted(wizard_theme())), 0);
     lv_obj_set_style_text_font(hint, body_font, 0);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -hint_bottom);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -rows.hint_gap);
 }
 
 static void finish_btn_event_cb(lv_event_t *e) {
@@ -531,7 +860,7 @@ static void show_complete_screen(void) {
     
     lv_obj_t *title = lv_label_create(root);
     lv_label_set_text(title, LV_SYMBOL_OK " Done!");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(title, wizard_color(theme_palette_get_text(wizard_theme())), 0);
     lv_obj_set_style_text_font(title, title_font, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, title_y);
 
@@ -570,7 +899,7 @@ static void show_complete_screen(void) {
 
     lv_obj_t *info = lv_label_create(root);
     lv_label_set_text(info, summary);
-    lv_obj_set_style_text_color(info, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_color(info, wizard_color(theme_palette_get_text_muted(wizard_theme())), 0);
     lv_obj_set_style_text_font(info, body_font, 0);
     lv_obj_set_style_text_align(info, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(info, USABLE_W - 10);
@@ -587,11 +916,11 @@ static void show_complete_screen(void) {
     lv_obj_t *finish_btn = lv_btn_create(root);
     gui_apply_pressed_style(finish_btn);
     lv_obj_set_size(finish_btn, btn_w, btn_h);
-    lv_obj_align(finish_btn, LV_ALIGN_BOTTOM_MID, 0, -btn_bottom);
-    style_wizard_btn(finish_btn, lv_color_hex(0xFFFFFF), 5);
+    lv_obj_align(finish_btn, LV_ALIGN_BOTTOM_MID, 0, -(GUI_HOME_SAFE_H + btn_bottom));
+    style_wizard_btn(finish_btn, wizard_color(theme_palette_get_accent(wizard_theme())), 5);
     lv_obj_t *finish_label = lv_label_create(finish_btn);
     lv_label_set_text(finish_label, "Finish");
-    lv_obj_set_style_text_color(finish_label, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_text_color(finish_label, wizard_color(theme_palette_get_on_accent(wizard_theme())), 0);
     lv_obj_center(finish_label);
     lv_obj_add_event_cb(finish_btn, finish_btn_event_cb, LV_EVENT_CLICKED, NULL);
 }
@@ -599,24 +928,11 @@ static void show_complete_screen(void) {
 static void apply_wifi_country(int country_index) {
     const WifiCountry *country = &wifi_countries[country_index];
     ESP_LOGI(TAG, "Applying WiFi country: %s (%s)", country->code, country->name);
-    
-#if CONFIG_IDF_TARGET_ESP32C5
+
     esp_err_t err = esp_wifi_set_country_code(country->code, true);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set country code: %s", esp_err_to_name(err));
     }
-#else
-    wifi_country_t wifi_country = {
-        .cc = {country->code[0], country->code[1], 0},
-        .schan = country->start_channel,
-        .nchan = country->num_channels,
-        .policy = WIFI_COUNTRY_POLICY_MANUAL
-    };
-    esp_err_t err = esp_wifi_set_country(&wifi_country);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set country: %s", esp_err_to_name(err));
-    }
-#endif
 }
 
 static void finish_setup(void) {
@@ -672,10 +988,15 @@ static void skip_setup(void) {
 
 static void setup_wizard_create(void) {
     ESP_LOGI(TAG, "Creating setup wizard, step=%d", current_step);
+    for (uint8_t theme = 0; theme < THEME_PALETTE_THEME_COUNT; ++theme) {
+        theme_options[theme] = theme_palette_get_name(theme);
+    }
     
-    display_manager_fill_screen(lv_color_hex(GUI_DEFAULT_BG_COLOR));
+    uint8_t theme = wizard_theme();
+    lv_color_t background = wizard_color(theme_palette_get_background(theme));
+    display_manager_fill_screen(background);
 
-    root = gui_screen_create_root_no_bg(NULL, "Setup", lv_color_hex(GUI_DEFAULT_BG_COLOR), LV_OPA_TRANSP);
+    root = gui_screen_create_root(NULL, "Setup", background, LV_OPA_COVER);
     setup_wizard_view.root = root;
 
     switch (current_step) {
@@ -799,7 +1120,7 @@ static void setup_wizard_create(void) {
             temp_font_size = settings_get_font_size(&G_Settings);
             temp_high_contrast = settings_get_high_contrast(&G_Settings);
             temp_reduced_motion = settings_get_reduced_motion(&G_Settings);
-            show_option_screen("Accessibility", font_size_options, FONT_SIZE_COUNT, temp_font_size);
+            show_option_screen("Text & Reading", font_size_options, FONT_SIZE_COUNT, temp_font_size);
             break;
 #ifdef CONFIG_WITH_STATUS_DISPLAY
         case SETUP_STEP_IDLE_ANIMATION:
@@ -823,6 +1144,8 @@ static void setup_wizard_destroy(void) {
     option_list = NULL;
     welcome_start_btn = NULL;
     welcome_skip_btn = NULL;
+    touch_started = false;
+    touch_drag_reset(&s_touch_drag);
 }
 
 static void setup_wizard_input_callback(InputEvent *event) {
@@ -836,22 +1159,25 @@ static void setup_wizard_input_callback(InputEvent *event) {
     if (event->type == INPUT_TYPE_TOUCH) {
         lv_indev_data_t *data = &event->data.touch_data;
         if (data->state == LV_INDEV_STATE_PR) {
-            touch_started = true;
-            touch_start_y = data->point.y;
-            touch_start_x = data->point.x;
+            if (!s_touch_drag.started) {
+                touch_started = true;
+                touch_start_y = data->point.y;
+                touch_start_x = data->point.x;
+                touch_drag_begin(&s_touch_drag, data);
+                return;
+            }
+            /* Move sample: feed the shared drag machine so lists scroll live
+             * (or release-on-release when the touch_drag_scroll setting is
+             * off), matching the other native views. */
+            touch_drag_update(&s_touch_drag, data, wizard_scroll_target());
             return;
         }
         if (data->state == LV_INDEV_STATE_REL && touch_started) {
             touch_started = false;
-            int dy = data->point.y - touch_start_y;
             int dx = data->point.x - touch_start_x;
-            
-            if (abs(dy) > 20) {
-                if (current_step == SETUP_STEP_COUNTRY && country_list) {
-                    lv_obj_scroll_by_bounded(country_list, 0, dy, LV_ANIM_OFF);
-                } else if (option_list) {
-                    lv_obj_scroll_by_bounded(option_list, 0, dy, LV_ANIM_OFF);
-                }
+            int dy = data->point.y - touch_start_y;
+            if (touch_drag_release(&s_touch_drag, data)) {
+                /* A drag scrolled the list; don't treat it as a tap. */
                 return;
             }
             
@@ -906,8 +1232,7 @@ static void setup_wizard_input_callback(InputEvent *event) {
                                 data->point.y >= btn_area.y1 && data->point.y <= btn_area.y2) {
                                 country_cursor = (int)i;
                                 selected_country_index = country_cursor;
-                                current_step = SETUP_STEP_TIMEZONE;
-                                display_manager_switch_view(&setup_wizard_view);
+                                wizard_goto_step(SETUP_STEP_TIMEZONE);
                                 return;
                             }
                         }
@@ -923,17 +1248,9 @@ static void setup_wizard_input_callback(InputEvent *event) {
                                 data->point.y >= btn_area.y1 && data->point.y <= btn_area.y2) {
                                 option_cursor = (int)i;
                                 update_option_selection(child_count);
-                                
-                                if (current_step == SETUP_STEP_TIMEZONE) temp_timezone = option_cursor;
-                                else if (current_step == SETUP_STEP_DISPLAY_TIMEOUT) temp_display_timeout = option_cursor;
-                                else if (current_step == SETUP_STEP_THEME) temp_theme = option_cursor;
-                                else if (current_step == SETUP_STEP_MENU_LAYOUT) temp_menu_layout = option_cursor;
-                                else if (current_step == SETUP_STEP_TERMINAL_COLOR) temp_terminal_color = option_cursor;
-                                else if (current_step == SETUP_STEP_EPILEPSY_WARNING) temp_epilepsy_warning = option_cursor;
-                                else if (current_step == SETUP_STEP_ACCESSIBILITY) temp_font_size = option_cursor;
-#ifdef CONFIG_WITH_STATUS_DISPLAY
-                                else if (current_step == SETUP_STEP_IDLE_ANIMATION) temp_idle_animation = option_cursor;
-#endif
+
+                                if (wizard_option_handle_paging()) return;
+                                wizard_option_apply_choice(wizard_option_cursor_tag());
                                 
                                 SetupStep next_step = SETUP_STEP_COMPLETE;
                                 SetupStep prev_step = SETUP_STEP_COUNTRY;
@@ -970,8 +1287,7 @@ static void setup_wizard_input_callback(InputEvent *event) {
 #endif
                                 }
                                 
-                                current_step = next_step;
-                                display_manager_switch_view(&setup_wizard_view);
+                                wizard_goto_step(next_step);
                                 return;
                             }
                         }
@@ -995,6 +1311,9 @@ static void setup_wizard_input_callback(InputEvent *event) {
                     welcome_btn_focus = 1;
                     update_welcome_btn_focus();
                 }
+            } else if (idx == 4) { // Down - cycle the two choices
+                welcome_btn_focus = (welcome_btn_focus + 1) % 2;
+                update_welcome_btn_focus();
             } else if (idx == 1) { // Select - activate focused button
                 if (welcome_btn_focus == 0) {
                     start_btn_event_cb(NULL);
@@ -1051,11 +1370,9 @@ static void setup_wizard_input_callback(InputEvent *event) {
                 }
             } else if (idx == 1 || idx == 3) { // Select/OK or Right
                 selected_country_index = country_cursor;
-                current_step = SETUP_STEP_TIMEZONE;
-                display_manager_switch_view(&setup_wizard_view);
+                wizard_goto_step(SETUP_STEP_TIMEZONE);
             } else if (idx == 0) { // Left/Back
-                current_step = SETUP_STEP_STA_SSID;
-                display_manager_switch_view(&setup_wizard_view);
+                wizard_goto_step(SETUP_STEP_STA_SSID);
             }
         } else if (event->type == INPUT_TYPE_KEYBOARD) {
             int kv = event->data.key_value;
@@ -1071,11 +1388,9 @@ static void setup_wizard_input_callback(InputEvent *event) {
                 }
             } else if (kv == LV_KEY_ENTER || kv == 13) { // enter
                 selected_country_index = country_cursor;
-                current_step = SETUP_STEP_TIMEZONE;
-                display_manager_switch_view(&setup_wizard_view);
+                wizard_goto_step(SETUP_STEP_TIMEZONE);
             } else if (kv == LV_KEY_ESC || kv == 29 || kv == '`') { // esc
-                current_step = SETUP_STEP_STA_SSID;
-                display_manager_switch_view(&setup_wizard_view);
+                wizard_goto_step(SETUP_STEP_STA_SSID);
             }
         }
 #ifdef CONFIG_USE_ENCODER
@@ -1087,8 +1402,7 @@ static void setup_wizard_input_callback(InputEvent *event) {
             }
             if (event->data.encoder.button) {
                 selected_country_index = country_cursor;
-                current_step = SETUP_STEP_TIMEZONE;
-                display_manager_switch_view(&setup_wizard_view);
+                wizard_goto_step(SETUP_STEP_TIMEZONE);
             }
         }
 #endif
@@ -1143,77 +1457,50 @@ static void setup_wizard_input_callback(InputEvent *event) {
         }
 #endif
 
+        int opt_children = (int)lv_obj_get_child_cnt(option_list);
+
         if (event->type == INPUT_TYPE_JOYSTICK) {
             int idx = event->data.joystick_index;
             if (idx == 2 && option_cursor > 0) { // Up
                 option_cursor--;
                 update_option_selection(count);
-            } else if (idx == 4 && option_cursor < count - 1) { // Down
+            } else if (idx == 4 && option_cursor < opt_children - 1) { // Down
                 option_cursor++;
                 update_option_selection(count);
             } else if (idx == 1 || idx == 3) { // Select
-                if (current_step == SETUP_STEP_TIMEZONE) temp_timezone = option_cursor;
-                else if (current_step == SETUP_STEP_DISPLAY_TIMEOUT) temp_display_timeout = option_cursor;
-                else if (current_step == SETUP_STEP_THEME) temp_theme = option_cursor;
-                else if (current_step == SETUP_STEP_MENU_LAYOUT) temp_menu_layout = option_cursor;
-                else if (current_step == SETUP_STEP_TERMINAL_COLOR) temp_terminal_color = option_cursor;
-                else if (current_step == SETUP_STEP_EPILEPSY_WARNING) temp_epilepsy_warning = option_cursor;
-                else if (current_step == SETUP_STEP_ACCESSIBILITY) temp_font_size = option_cursor;
-#ifdef CONFIG_WITH_STATUS_DISPLAY
-                else if (current_step == SETUP_STEP_IDLE_ANIMATION) temp_idle_animation = option_cursor;
-#endif
-                current_step = next_step;
-                display_manager_switch_view(&setup_wizard_view);
+                if (wizard_option_handle_paging()) return;
+                wizard_option_apply_choice(wizard_option_cursor_tag());
+                wizard_goto_step(next_step);
             } else if (idx == 0) { // Back
-                current_step = prev_step;
-                display_manager_switch_view(&setup_wizard_view);
+                wizard_goto_step(prev_step);
             }
         } else if (event->type == INPUT_TYPE_KEYBOARD) {
             int kv = event->data.key_value;
             if ((kv == LV_KEY_UP || kv == 'k' || kv == ';') && option_cursor > 0) { // up/k/semicolon
                 option_cursor--;
                 update_option_selection(count);
-            } else if ((kv == LV_KEY_DOWN || kv == 'j' || kv == '.') && option_cursor < count - 1) { // down/j/period
+            } else if ((kv == LV_KEY_DOWN || kv == 'j' || kv == '.') && option_cursor < opt_children - 1) { // down/j/period
                 option_cursor++;
                 update_option_selection(count);
             } else if (kv == LV_KEY_ENTER || kv == 13) { // enter
-                if (current_step == SETUP_STEP_TIMEZONE) temp_timezone = option_cursor;
-                else if (current_step == SETUP_STEP_DISPLAY_TIMEOUT) temp_display_timeout = option_cursor;
-                else if (current_step == SETUP_STEP_THEME) temp_theme = option_cursor;
-                else if (current_step == SETUP_STEP_MENU_LAYOUT) temp_menu_layout = option_cursor;
-                else if (current_step == SETUP_STEP_TERMINAL_COLOR) temp_terminal_color = option_cursor;
-                else if (current_step == SETUP_STEP_EPILEPSY_WARNING) temp_epilepsy_warning = option_cursor;
-                else if (current_step == SETUP_STEP_ACCESSIBILITY) temp_font_size = option_cursor;
-#ifdef CONFIG_WITH_STATUS_DISPLAY
-                else if (current_step == SETUP_STEP_IDLE_ANIMATION) temp_idle_animation = option_cursor;
-#endif
-                current_step = next_step;
-                display_manager_switch_view(&setup_wizard_view);
+                if (wizard_option_handle_paging()) return;
+                wizard_option_apply_choice(wizard_option_cursor_tag());
+                wizard_goto_step(next_step);
             } else if (kv == LV_KEY_ESC || kv == 29 || kv == '`') { // esc
-                current_step = prev_step;
-                display_manager_switch_view(&setup_wizard_view);
+                wizard_goto_step(prev_step);
             }
         }
 #ifdef CONFIG_USE_ENCODER
         else if (event->type == INPUT_TYPE_ENCODER) {
             int dir = event->data.encoder.direction;
-            if (dir != 0) {
-                option_cursor = (option_cursor + dir + count) % count;
+            if (dir != 0 && opt_children > 0) {
+                option_cursor = (option_cursor + dir + opt_children) % opt_children;
                 update_option_selection(count);
             }
             if (event->data.encoder.button) {
-                if (current_step == SETUP_STEP_TIMEZONE) temp_timezone = option_cursor;
-                else if (current_step == SETUP_STEP_DISPLAY_TIMEOUT) temp_display_timeout = option_cursor;
-                else if (current_step == SETUP_STEP_THEME) temp_theme = option_cursor;
-                else if (current_step == SETUP_STEP_MENU_LAYOUT) temp_menu_layout = option_cursor;
-                else if (current_step == SETUP_STEP_TERMINAL_COLOR) temp_terminal_color = option_cursor;
-                else if (current_step == SETUP_STEP_EPILEPSY_WARNING) temp_epilepsy_warning = option_cursor;
-                else if (current_step == SETUP_STEP_ACCESSIBILITY) temp_font_size = option_cursor;
-#ifdef CONFIG_WITH_STATUS_DISPLAY
-                else if (current_step == SETUP_STEP_IDLE_ANIMATION) temp_idle_animation = option_cursor;
-#endif
-                current_step = next_step;
-                display_manager_switch_view(&setup_wizard_view);
+                if (wizard_option_handle_paging()) return;
+                wizard_option_apply_choice(wizard_option_cursor_tag());
+                wizard_goto_step(next_step);
             }
         }
 #endif
@@ -1253,6 +1540,9 @@ void setup_wizard_reset_and_open(void) {
     temp_terminal_color = 0;
     temp_epilepsy_warning = 1;
     temp_font_size = 1;
+#ifdef CONFIG_IS_ATOMS3R
+    temp_font_size = 0;
+#endif
     temp_reduced_motion = 0;
     temp_high_contrast = 0;
 #ifdef CONFIG_WITH_STATUS_DISPLAY

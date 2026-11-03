@@ -8,18 +8,16 @@
 #include "managers/settings_manager.h"
 #include "managers/status_display_manager.h"
 #include "managers/wifi_manager.h"
-#ifndef CONFIG_IDF_TARGET_ESP32S2
+#include "scans/wifi/hop_profile.h"
+#include "scans/wifi/wifi_channels.h"
+#if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(GHOSTESP_NO_NATIVE_BLE)
 #include "managers/ble_manager.h"
 #endif
 #include "vendor/pcap.h"
 #include "esp_log.h"
 #include "esp_mac.h"
-#include "esp_sntp.h"
 #include "esp_wifi.h"
 #include "sdkconfig.h"
-#ifdef CONFIG_HAS_RTC_CLOCK
-#include "vendor/drivers/pcf8563.h"
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,7 +78,7 @@ void cmd_wifi_scan_stop(int argc, char **argv) {
     // entry, so this function is the only thing that brings the AP back for
     // those flows. Always restore AP services before returning, regardless
     // of whether the Wi-Fi driver restart succeeded.
-    ap_manager_start_services();
+    (void)ap_manager_restore_after_attack("scan stop");
 
     if (stop_err != ESP_OK || start_err != ESP_OK) {
         glog("WiFi scan stop completed with recovery errors (stop=%s, start=%s).\n",
@@ -110,7 +108,7 @@ void handle_list(int argc, char **argv) {
         glog("Listed Stations...\n");
         return;
     }
-#ifndef CONFIG_IDF_TARGET_ESP32S2
+#if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(GHOSTESP_NO_NATIVE_BLE)
     else if (argc > 1 && strcmp(argv[1], "-airtags") == 0) {
         ble_list_airtags();
         return;
@@ -153,6 +151,91 @@ void handle_beaconspam(int argc, char **argv) {
     }
 }
 
+static const char *hop_mode_name(hop_mode_t mode) {
+    switch (mode) {
+        case HOP_MODE_DEFAULT: return "auto";
+        case HOP_MODE_ALL: return "all";
+        case HOP_MODE_BASIC: return "basic";
+        case HOP_MODE_CUSTOM: return "custom";
+        default: return "auto";
+    }
+}
+
+static void hop_print_mode(const char *verb) {
+    hop_mode_t mode = HOP_MODE_DEFAULT;
+    hop_profile_get_mode(&mode);
+
+    glog("Hop mode: %s", hop_mode_name(mode));
+    if (mode == HOP_MODE_CUSTOM) {
+        const char *custom = hop_profile_get_custom_str();
+        glog(" [%s]", (custom && *custom) ? custom : "empty");
+    }
+
+    uint8_t channels[WIFI_CHANNELS_MAX] = {0};
+    size_t count = 0;
+    hop_profile_resolve_monitor(channels, sizeof(channels), &count);
+    glog(" -> %u channel", (unsigned)count);
+    if (count != 1) glog("s");
+    glog(": ");
+    for (size_t i = 0; i < count; i++) {
+        glog("%s%u", (i == 0) ? "" : ",", (unsigned)channels[i]);
+    }
+    if (count == 0) glog("(feature auto list)");
+    glog("\n");
+
+    if (verb && *verb) {
+        status_display_show_status(verb);
+    }
+}
+
+void handle_hop_cmd(int argc, char **argv) {
+    hop_mode_t mode = HOP_MODE_DEFAULT;
+    hop_profile_get_mode(&mode);
+    bool saved = false;
+
+    if (argc < 2) {
+        hop_print_mode(NULL);
+        return;
+    }
+
+    if (strcmp(argv[1], "auto") == 0 || strcmp(argv[1], "default") == 0 ||
+        strcmp(argv[1], "clear") == 0) {
+        hop_profile_set_mode(HOP_MODE_DEFAULT);
+        saved = true;
+    } else if (strcmp(argv[1], "all") == 0) {
+        hop_profile_set_mode(HOP_MODE_ALL);
+        saved = true;
+    } else if (strcmp(argv[1], "basic") == 0 || strcmp(argv[1], "1,6,11") == 0) {
+        hop_profile_set_mode(HOP_MODE_BASIC);
+        saved = true;
+    } else if (strcmp(argv[1], "custom") == 0) {
+        if (argc < 3) {
+            glog("Usage: hop custom <1,2,3> | hop 1,2,3\n");
+            return;
+        }
+        if (!hop_profile_set_custom_from_string(argv[2])) {
+            glog("Invalid channel list '%s'. Use channels supported by this target and country\n", argv[2]);
+            return;
+        }
+        hop_profile_set_mode(HOP_MODE_CUSTOM);
+        saved = true;
+    } else {
+        // Treat the argument as a bare channel list.
+        if (!hop_profile_set_custom_from_string(argv[1])) {
+            glog("Usage: hop [auto|all|basic|custom <1,2,3>|1,2,3]\n");
+            glog("Invalid channel list '%s'. Use channels supported by this target and country\n", argv[1]);
+            return;
+        }
+        hop_profile_set_mode(HOP_MODE_CUSTOM);
+        saved = true;
+    }
+
+    if (saved) {
+        settings_save(&G_Settings);
+        hop_print_mode("Hop Set");
+    }
+}
+
 void handle_stop_spam(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -190,6 +273,21 @@ void handle_attack_cmd(int argc, char **argv) {
             wifi_manager_start_eapollogoff_attack();
             status_display_show_status("EAPOL Start");
             return;
+        } else if (strcmp(argv[1], "-p") == 0) {
+            glog("Probe Request Flood starting...\n");
+            wifi_manager_start_probe_flood();
+            status_display_show_status("Probe Flood Start");
+            return;
+        } else if (strcmp(argv[1], "-b") == 0) {
+            glog("Bad Msg attack starting...\n");
+            wifi_manager_start_bad_msg();
+            status_display_show_status("Bad Msg Start");
+            return;
+        } else if (strcmp(argv[1], "-a") == 0) {
+            glog("Auth Flood attack starting...\n");
+            wifi_manager_start_auth_flood();
+            status_display_show_status("Auth Flood Start");
+            return;
         } else if (strcmp(argv[1], "-s") == 0) {
             if (argc < 3) {
                 glog("Usage: attack -s <password>\n");
@@ -212,7 +310,7 @@ void handle_attack_cmd(int argc, char **argv) {
             return;
         }
     }
-    glog("Usage: attack -d (deauth) | attack -hsd (handshake+deauth) | attack -c (channel switch) | attack -e (EAPOL logoff) | attack -s <password> (SAE flood) | attack -g <ssid> <password> (GTK abuse)\n");
+    glog("Usage: attack -d (deauth) | attack -hsd (handshake+deauth) | attack -c (channel switch) | attack -e (EAPOL logoff) | attack -p (probe flood) | attack -b (bad msg) | attack -a (auth flood) | attack -s <password> (SAE flood) | attack -g <ssid> <password> (GTK abuse)\n");
     status_display_show_status("Attack Usage");
 }
 
@@ -251,6 +349,9 @@ void handle_stop_deauth(int argc, char **argv) {
     wifi_manager_stop_sae_flood();
     wifi_manager_stop_channel_switch_attack();
     wifi_manager_stop_gtk_abuse();
+    wifi_manager_stop_probe_flood();
+    wifi_manager_stop_bad_msg();
+    wifi_manager_stop_auth_flood();
     glog("All WiFi attacks stopped...\n");
     status_display_show_status("Attacks Off");
 }
@@ -318,7 +419,7 @@ void handle_select_cmd(int argc, char **argv) {
         } else {
             glog("Error: '%s' is not a valid number.\n", argv[2]);
         }
-#ifndef CONFIG_IDF_TARGET_ESP32S2
+#if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(GHOSTESP_NO_NATIVE_BLE)
     } else if (strcmp(argv[1], "-airtag") == 0) {
         char *endptr;
         int num = (int)strtol(argv[2], &endptr, 10);
@@ -387,35 +488,6 @@ void handle_track_sta_cmd(int argc, char **argv) {
     wifi_manager_track_sta();
 }
 
-#ifdef CONFIG_HAS_RTC_CLOCK
-// Time synchronization callback for SNTP
-static void sntp_time_sync_callback(struct timeval *tv) {
-    if (tv && tv->tv_sec > 1600000000) { // Valid time (after Sept 2020)
-        struct tm timeinfo;
-        struct tm utc_timeinfo;
-
-        // Get local time for display
-        localtime_r(&tv->tv_sec, &timeinfo);
-
-        // Save UTC time to RTC (not local time)
-        gmtime_r(&tv->tv_sec, &utc_timeinfo);
-        RTC_Date rtc_time;
-        rtc_time.year = utc_timeinfo.tm_year + 1900;
-        rtc_time.month = utc_timeinfo.tm_mon + 1;
-        rtc_time.day = utc_timeinfo.tm_mday;
-        rtc_time.hour = utc_timeinfo.tm_hour;
-        rtc_time.minute = utc_timeinfo.tm_min;
-        rtc_time.second = utc_timeinfo.tm_sec;
-
-        if (rtc_set_datetime(&rtc_time) == ESP_OK) {
-            ESP_LOGI("SNTP", "Time synchronized from NTP and UTC saved to RTC: %04d-%02d-%02d %02d:%02d:%02d",
-                     rtc_time.year, rtc_time.month, rtc_time.day,
-                     rtc_time.hour, rtc_time.minute, rtc_time.second);
-        }
-    }
-}
-#endif
-
 void handle_wifi_connection(int argc, char **argv) {
     const char *ssid;
     const char *password;
@@ -429,78 +501,14 @@ void handle_wifi_connection(int argc, char **argv) {
         }
         glog("Connecting using saved credentials: %s\n", ssid);
     } else {
-        char ssid_buffer[128] = {0};
-        char password_buffer[128] = {0};
-        int i = 1;
-        // SSID parsing
-        if (argv[1][0] == '"') {
-            char *dest = ssid_buffer;
-            bool found_end = false;
-            strncpy(dest, &argv[1][1], sizeof(ssid_buffer) - 1);
-            dest += strlen(&argv[1][1]);
-            if (argv[1][strlen(argv[1]) - 1] == '"') {
-                ssid_buffer[strlen(ssid_buffer) - 1] = '\0';
-                found_end = true;
-            }
-            i = 2;
-            while (!found_end && i < argc) {
-                *dest++ = ' ';
-                if (strchr(argv[i], '"')) {
-                    size_t len = strchr(argv[i], '"') - argv[i];
-                    strncpy(dest, argv[i], len);
-                    dest[len] = '\0';
-                    found_end = true;
-                } else {
-                    strncpy(dest, argv[i], sizeof(ssid_buffer) - (dest - ssid_buffer) - 1);
-                    dest += strlen(argv[i]);
-                }
-                i++;
-            }
-            if (!found_end) {
-                glog("Error: Missing closing quote for SSID\n");
-                return;
-            }
-            ssid = ssid_buffer;
-        } else {
-            ssid = argv[1];
-            i = 2;
+        if (argc > 3) {
+            glog("Usage: connect <SSID> [PASSWORD] (quote arguments containing spaces)\n");
+            return;
         }
-        // Password parsing
-        if (i < argc) {
-            if (argv[i][0] == '"') {
-                char *dest = password_buffer;
-                bool found_end = false;
-                strncpy(dest, &argv[i][1], sizeof(password_buffer) - 1);
-                dest += strlen(&argv[i][1]);
-                if (argv[i][strlen(argv[i]) - 1] == '"') {
-                    password_buffer[strlen(password_buffer) - 1] = '\0';
-                    found_end = true;
-                }
-                i++;
-                while (!found_end && i < argc) {
-                    *dest++ = ' ';
-                    if (strchr(argv[i], '"')) {
-                        size_t len = strchr(argv[i], '"') - argv[i];
-                        strncpy(dest, argv[i], len);
-                        dest[len] = '\0';
-                        found_end = true;
-                    } else {
-                        strncpy(dest, argv[i], sizeof(password_buffer) - (dest - password_buffer) - 1);
-                        dest += strlen(argv[i]);
-                    }
-                    i++;
-                }
-                if (!found_end) {
-                    glog("Error: Missing closing quote for password\n");
-                    return;
-                }
-                password = password_buffer;
-            } else {
-                password = argv[i];
-            }
-        } else {
-            password = "";
-        }
+        // handle_serial_command already removed quote delimiters. Parse once;
+        // literal quotes inside a credential are data, not another quoting layer.
+        ssid = argv[1];
+        password = argc > 2 ? argv[2] : "";
         // Save provided credentials to NVS
         settings_set_sta_ssid(&G_Settings, ssid);
         settings_set_sta_password(&G_Settings, password);
@@ -509,16 +517,7 @@ void handle_wifi_connection(int argc, char **argv) {
     wifi_manager_set_manual_disconnect(false);
     wifi_manager_connect_wifi(ssid, password);
 
-    if (!esp_sntp_enabled()) {
-        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-        esp_sntp_setservername(0, "pool.ntp.org");
-
-#ifdef CONFIG_HAS_RTC_CLOCK
-        esp_sntp_set_time_sync_notification_cb(sntp_time_sync_callback);
-#endif
-
-        esp_sntp_init();
-    }
+    wifi_manager_start_sntp();
 }
 
 void handle_wifi_disconnect(int argc, char **argv) {

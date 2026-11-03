@@ -15,6 +15,7 @@
 #include "core/uart_share.h"
 #include "soc/uart_pins.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
 #include "esp_system.h"
@@ -27,9 +28,39 @@
 #include "managers/views/terminal_screen.h"
 #include "managers/ap_manager.h"
 #include "managers/peer_storage_manager.h"
+#ifdef CONFIG_HAS_MIC
+#include "managers/microphone/mic_visualizer.h"
+#endif
 
 #define COMM_BUFFER_SIZE 256
-#define UART_RX_BUFFER_SIZE (COMM_BUFFER_SIZE * 2)
+/* UART RX ring size.
+ *
+ * comm_rx_task now runs above the render (15) and hardware-input (14) tasks
+ * and yields a tick every UART_RX_YIELD_BYTES, so a busy display can no longer
+ * starve the receiver for a whole frame. The ring still has to absorb that
+ * yield plus longer stalls (flash writes, WiFi, interrupt latency): a 512-byte
+ * ring is only ~6 ms of slack at 921600 and measurably dropped bytes on the
+ * unicore C5, 2048 restores margin. The high-water alert threshold is derived
+ * from this value, so it scales automatically.
+ * Costs ~1.5 KB of internal RAM. */
+#define UART_RX_BUFFER_SIZE 2048
+#define COMM_RX_TASK_STACK_BYTES 4096
+
+/* comm_rx_task priority. Must sit above RENDERING_TASK_PRIORITY (15) and
+ * HARDWARE_INPUT_TASK_PRIORITY (14) so a long frame cannot overflow the ring
+ * while LVGL redraws, but below the ESP-IDF system tasks (esp_timer 22, IPC
+ * 24) so those still get their slices. */
+#define COMM_RX_TASK_PRIO 16
+
+/* Bytes comm_rx_task may process between one-tick yields. At the fastest
+ * supported baud this is >20 ms of line time, so the ring absorbs the gap and
+ * throughput is unaffected while the UI and idle task keep running. */
+#define UART_RX_YIELD_BYTES UART_RX_BUFFER_SIZE
+
+/* GhostLink UART baud for the board templates that set one explicitly.
+ * 921600 is 2x the previous 460800 and well inside the ESP32 UART limit, but
+ * needs the enlarged RX ring above to avoid increasing receive loss. */
+#define COMM_DEFAULT_BAUD 921600
 #define COMM_PACKET_SIZE 64
 #define DISCOVERY_INTERVAL_MS 3000
 #define HANDSHAKE_TIMEOUT_MS 3000
@@ -65,6 +96,25 @@
 #endif
 
 static const char* TAG = "esp_comm_manager";
+
+static bool comm_pins_conflict_with_rgb_display(gpio_num_t tx_pin, gpio_num_t rx_pin)
+{
+#if defined(CONFIG_CROWPANEL_P4_PANEL_RGB_800X480)
+    // 5-inch P4: RGB data uses GPIO4..19, DE/PCLK use 2/3, HSYNC/VSYNC use 40/41.
+    const int pins[] = { (int)tx_pin, (int)rx_pin };
+    for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); ++i) {
+        if ((pins[i] >= 2 && pins[i] <= 19) || pins[i] == 40 || pins[i] == 41) {
+            ESP_LOGW(TAG, "GhostLink TX:%d RX:%d conflicts with 5-inch RGB display; choose free pins",
+                     (int)tx_pin, (int)rx_pin);
+            return true;
+        }
+    }
+#else
+    (void)tx_pin;
+    (void)rx_pin;
+#endif
+    return false;
+}
 
 typedef enum {
     PACKET_TYPE_DISCOVERY = 0x01,
@@ -104,6 +154,32 @@ typedef struct {
     char* dynamic_data;
 } comm_command_t;
 
+#define COMM_TX_QUEUE_DEPTH 16
+#define COMM_RX_QUEUE_DEPTH 64
+#define COMM_COMMAND_QUEUE_DEPTH 4
+
+EXT_RAM_BSS_ATTR static uint8_t s_tx_queue_storage[COMM_TX_QUEUE_DEPTH * sizeof(comm_packet_t)];
+EXT_RAM_BSS_ATTR static uint8_t s_rx_queue_storage[COMM_RX_QUEUE_DEPTH * sizeof(comm_packet_t)];
+EXT_RAM_BSS_ATTR static uint8_t s_command_queue_storage[COMM_COMMAND_QUEUE_DEPTH * sizeof(comm_command_t)];
+static StaticQueue_t s_tx_queue_control;
+static StaticQueue_t s_rx_queue_control;
+static StaticQueue_t s_command_queue_control;
+
+static QueueHandle_t create_tx_queue(void) {
+    return xQueueCreateStatic(COMM_TX_QUEUE_DEPTH, sizeof(comm_packet_t),
+                              s_tx_queue_storage, &s_tx_queue_control);
+}
+
+static QueueHandle_t create_rx_queue(void) {
+    return xQueueCreateStatic(COMM_RX_QUEUE_DEPTH, sizeof(comm_packet_t),
+                              s_rx_queue_storage, &s_rx_queue_control);
+}
+
+static QueueHandle_t create_command_queue(void) {
+    return xQueueCreateStatic(COMM_COMMAND_QUEUE_DEPTH, sizeof(comm_command_t),
+                              s_command_queue_storage, &s_command_queue_control);
+}
+
 typedef struct {
     gpio_num_t tx_pin;
     gpio_num_t rx_pin;
@@ -140,6 +216,7 @@ typedef struct {
     uint32_t tx_dropped_packets;
     uint32_t rx_queue_dropped_packets;
     uint32_t rx_crc_error_count;
+    uint32_t stream_ignored_packets;
     size_t rx_buffer_high_watermark;
     uint32_t rx_high_water_alerts;
 
@@ -304,7 +381,7 @@ static bool ensure_command_executor(esp_comm_manager_t* comm) {
         return false;
     }
     if (!comm->command_queue) {
-        comm->command_queue = xQueueCreate(4, sizeof(comm_command_t));
+        comm->command_queue = create_command_queue();
     }
     if (comm->command_queue && !comm->command_executor_task_handle) {
         TaskHandle_t t = create_task_static(&comm->command_task_res, command_executor_task,
@@ -636,6 +713,7 @@ static void tx_task(void* arg) {
 static void rx_task(void* arg) {
     esp_comm_manager_t* comm = (esp_comm_manager_t*)arg;
     uint8_t rx_buffer[COMM_BUFFER_SIZE];
+    size_t since_yield = 0;
 
     while (comm->initialized) {
         int len = uart_read_bytes(s_uart_num, rx_buffer, COMM_BUFFER_SIZE, pdMS_TO_TICKS(10));
@@ -648,15 +726,19 @@ static void rx_task(void* arg) {
         while (len > 0) {
             size_t buffered_len = 0;
             if (uart_get_buffered_data_len(s_uart_num, &buffered_len) == ESP_OK) {
-                if (buffered_len > comm->rx_buffer_high_watermark) {
-                    comm->rx_buffer_high_watermark = buffered_len;
+                // uart_read_bytes() has already removed len bytes from the ring.
+                // Include those bytes so short bursts do not misleadingly
+                // report a zero-byte high-water mark.
+                size_t burst_len = (size_t)len + buffered_len;
+                if (burst_len > comm->rx_buffer_high_watermark) {
+                    comm->rx_buffer_high_watermark = burst_len;
                 }
                 size_t alert_threshold = UART_RX_BUFFER_SIZE * 3 / 4;
-                if (buffered_len > alert_threshold) {
+                if (burst_len > alert_threshold) {
                     comm->rx_high_water_alerts++;
                     if ((comm->rx_high_water_alerts & 0x0F) == 1) {
-                        printf("UART RX buffered %u bytes (alerts=%lu)\n",
-                               (unsigned)buffered_len, (unsigned long)comm->rx_high_water_alerts);
+                        printf("UART RX burst %u bytes (alerts=%lu)\n",
+                               (unsigned)burst_len, (unsigned long)comm->rx_high_water_alerts);
                     }
                 }
             }
@@ -760,11 +842,20 @@ static void rx_task(void* arg) {
                 }
             }
 
+            since_yield += (size_t)len;
+
             int drained = uart_read_bytes(s_uart_num, rx_buffer, COMM_BUFFER_SIZE, 0);
             if (drained > 0) {
                 len = drained;
             } else {
                 len = 0;
+            }
+
+            if (since_yield >= UART_RX_YIELD_BYTES) {
+                /* See COMM_RX_TASK_PRIO: without this the higher-priority task
+                 * would starve the UI and idle task for a whole stream. */
+                vTaskDelay(1);
+                since_yield = 0;
             }
         }
     }
@@ -815,7 +906,7 @@ static void send_handshake_ack(void) {
 
 static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t* packet) {
     if (!comm || !packet) return;
-    static char log_buffer[128];
+    static char log_buffer[sizeof(comm->response_assembly) + 8];
 
     switch(packet->type) {
         case PACKET_TYPE_DISCOVERY:
@@ -850,7 +941,7 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
                         xTimerStart(comm->handshake_timer, 0);
                     }
                     if (comm->command_callback && !comm->command_queue) {
-                        comm->command_queue = xQueueCreate(4, sizeof(comm_command_t));
+                        comm->command_queue = create_command_queue();
                         if (comm->command_queue && !comm->command_executor_task_handle) {
                             TaskHandle_t t = create_task_static(&comm->command_task_res, command_executor_task,
                                                                "comm_cmd_exec_task", 3072, comm, 5);
@@ -885,7 +976,7 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
                         xTimerStart(comm->ping_timer, 0);
                     }
                     if (!comm->tx_queue) {
-                        comm->tx_queue = xQueueCreate(16, sizeof(comm_packet_t));
+                        comm->tx_queue = create_tx_queue();
                     }
                     if (!comm->tx_task_handle && comm->tx_queue) {
                         TaskHandle_t t = create_task_static(&comm->tx_task_res, tx_task,
@@ -897,7 +988,7 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
                         comm->tx_task_handle = t;
                     }
                     if (!comm->rx_packet_queue) {
-                        comm->rx_packet_queue = xQueueCreate(64, sizeof(comm_packet_t));
+                        comm->rx_packet_queue = create_rx_queue();
                     }
                     if (!comm->protocol_task_handle && comm->rx_packet_queue) {
                         TaskHandle_t t = create_task_static(&comm->protocol_task_res, protocol_task,
@@ -909,8 +1000,13 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
                         comm->protocol_task_handle = t;
                     }
                     unlock_state(comm);
-                    printf("Handshake complete!\n");
+                    printf("Handshake completed!\n");
                     terminal_view_add_text("Handshake completed!\n");
+#ifdef CONFIG_HAS_MIC
+                    // Headless boards skip boot-time mic capture; start the
+                    // GhostLink amplitude stream now that a peer is listening.
+                    (void)mic_visualizer_start();
+#endif
                 }
             }
             break;
@@ -930,7 +1026,7 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
                     xTimerStop(comm->handshake_timer, 0);
                 }
                 if (comm->command_callback && !comm->command_queue) {
-                    comm->command_queue = xQueueCreate(4, sizeof(comm_command_t));
+                    comm->command_queue = create_command_queue();
                     if (comm->command_queue && !comm->command_executor_task_handle) {
                         TaskHandle_t t = create_task_static(&comm->command_task_res, command_executor_task,
                                                            "comm_cmd_exec_task", 3072, comm, 5);
@@ -953,7 +1049,7 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
                     xTimerStart(comm->ping_timer, 0);
                 }
                 if (!comm->tx_queue) {
-                    comm->tx_queue = xQueueCreate(16, sizeof(comm_packet_t));
+                    comm->tx_queue = create_tx_queue();
                 }
                 if (!comm->tx_task_handle && comm->tx_queue) {
                     TaskHandle_t t = create_task_static(&comm->tx_task_res, tx_task,
@@ -965,7 +1061,7 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
                     comm->tx_task_handle = t;
                 }
                 if (!comm->rx_packet_queue) {
-                    comm->rx_packet_queue = xQueueCreate(64, sizeof(comm_packet_t));
+                    comm->rx_packet_queue = create_rx_queue();
                 }
                 if (!comm->protocol_task_handle && comm->rx_packet_queue) {
                     TaskHandle_t t = create_task_static(&comm->protocol_task_res, protocol_task,
@@ -977,8 +1073,13 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
                     comm->protocol_task_handle = t;
                 }
                 unlock_state(comm);
-                printf("Handshake complete!\n");
+                printf("Handshake completed!\n");
                 terminal_view_add_text("Handshake completed!\n");
+#ifdef CONFIG_HAS_MIC
+                // Headless boards skip boot-time mic capture; start the
+                // GhostLink amplitude stream now that a peer is listening.
+                (void)mic_visualizer_start();
+#endif
             }
             break;
 
@@ -1009,17 +1110,29 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
 
         case PACKET_TYPE_STREAM:
             if (comm->state != COMM_STATE_CONNECTED) {
-                printf("STREAM packet ignored: not connected\n");
+                comm->stream_ignored_packets++;
+                if ((comm->stream_ignored_packets & 0x0F) == 1) {
+                    printf("STREAM packet ignored: not connected (ignored=%lu)\n",
+                           (unsigned long)comm->stream_ignored_packets);
+                }
                 break;
             }
             if (packet->length < 1) {
-                printf("STREAM packet ignored: empty payload\n");
+                comm->stream_ignored_packets++;
+                if ((comm->stream_ignored_packets & 0x0F) == 1) {
+                    printf("STREAM packet ignored: empty payload (ignored=%lu)\n",
+                           (unsigned long)comm->stream_ignored_packets);
+                }
                 break;
             }
             {
                 uint8_t channel = packet->data[0];
                 if (channel >= COMM_MAX_STREAM_CHANNELS) {
-                    printf("STREAM packet ignored: invalid channel %d\n", channel);
+                    comm->stream_ignored_packets++;
+                    if ((comm->stream_ignored_packets & 0x0F) == 1) {
+                        printf("STREAM packet ignored: invalid channel %d (ignored=%lu)\n",
+                               channel, (unsigned long)comm->stream_ignored_packets);
+                    }
                     break;
                 }
                 comm_stream_callback_t cb = comm->stream_handlers[channel];
@@ -1130,8 +1243,7 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
                         // force flush oldest buffered data if no newline present
                         size_t line_len = comm->response_assembly_len;
                         if (line_len > 0) {
-                            if (line_len > 255) line_len = 255;
-                            char line[256];
+                            char line[sizeof(comm->response_assembly) + 1];
                             memcpy(line, comm->response_assembly, line_len);
                             line[line_len] = '\0';
                             printf("ESP Comm Response: %s\n", line);
@@ -1160,8 +1272,7 @@ static void handle_received_packet(esp_comm_manager_t* comm, const comm_packet_t
                             if (c == '\n' && line_len > 0 && comm->response_assembly[i - 1] == '\r') {
                                 line_len -= 1;
                             }
-                            if (line_len > 255) line_len = 255;
-                            char line[256];
+                            char line[sizeof(comm->response_assembly) + 1];
                             memcpy(line, comm->response_assembly + start, line_len);
                             line[line_len] = '\0';
                             printf("ESP Comm Response: %s\n", line);
@@ -1272,6 +1383,12 @@ void esp_comm_manager_init_with_defaults(void) {
 }
 
 void esp_comm_manager_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud_rate) {
+#if defined(CONFIG_CROWPANEL_ADVANCE_S3_LCD)
+    // This profile selects the SD slot, not the mutually exclusive wireless
+    // socket. Also block direct CLI initialization with the generic 6/7 pins.
+    printf("ESP Comm Manager disabled on CrowPanel Advance S3 (SD/display profile)\n");
+    return;
+#endif
     ESP_LOGI(TAG, "esp_comm_manager_init: starting, free internal RAM: %d bytes",
              (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     if (s_comm_manager) {
@@ -1299,14 +1416,14 @@ void esp_comm_manager_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud_r
             resolved_tx = GPIO_NUM_13;
             resolved_rx = GPIO_NUM_14;
         }
-        resolved_baud = 460800;
+        resolved_baud = COMM_DEFAULT_BAUD;
     } else if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething2") == 0) {
         desired_uart = UART_NUM_1;
         if ((int)tx_pin == (int)DEFAULT_TX_PIN && (int)rx_pin == (int)DEFAULT_RX_PIN) {
             resolved_tx = GPIO_NUM_9;
             resolved_rx = GPIO_NUM_10;
         }
-        resolved_baud = 460800;
+        resolved_baud = COMM_DEFAULT_BAUD;
     } else if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "Ace_S3") == 0) {
         desired_uart = UART_NUM_1;
         if ((int)tx_pin == (int)DEFAULT_TX_PIN && (int)rx_pin == (int)DEFAULT_RX_PIN) {
@@ -1333,12 +1450,29 @@ void esp_comm_manager_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud_r
             resolved_tx = GPIO_NUM_11;
             resolved_rx = GPIO_NUM_12;
         }
+    } else if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "ghostlink_p1_core") == 0) {
+        desired_uart = UART_NUM_1;
+        if ((int)tx_pin == (int)DEFAULT_TX_PIN && (int)rx_pin == (int)DEFAULT_RX_PIN) {
+            // Straight-through wiring: core TX5 -> peer RX5, peer TX6 -> core RX6.
+            resolved_tx = GPIO_NUM_5;
+            resolved_rx = GPIO_NUM_6;
+        }
+    } else if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "ghostlink_p1_peer") == 0) {
+        desired_uart = UART_NUM_1;
+        if ((int)tx_pin == (int)DEFAULT_TX_PIN && (int)rx_pin == (int)DEFAULT_RX_PIN) {
+            resolved_tx = GPIO_NUM_6;
+            resolved_rx = GPIO_NUM_5;
+        }
     } else {
         desired_uart = UART_NUM_1;
     }
 #else
     desired_uart = UART_NUM_1;
 #endif
+
+    if (comm_pins_conflict_with_rgb_display(resolved_tx, resolved_rx)) {
+        return;
+    }
 
     /* If another subsystem (e.g. GPS NMEA parser) already owns this UART, do not init DualComm. */
     // prefer PSRAM if available, fall back to internal RAM (e.g. ESP32-C6 lacks SPIRAM)
@@ -1421,7 +1555,15 @@ void esp_comm_manager_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud_r
     }
 #endif
 
-    if (uart_share_ensure_installed(s_uart_num, COMM_BUFFER_SIZE * 2, 0, 0) == ESP_OK) {
+    // ESP32 no-PSRAM boards use UART2 for GPS. GhostLink on UART1 reads bytes
+    // directly and never consumes the driver's 16-entry UART event queue.
+#if defined(CONFIG_IDF_TARGET_ESP32) && !defined(CONFIG_SPIRAM)
+    const int comm_uart_event_queue_size = -1;
+#else
+    const int comm_uart_event_queue_size = 0;
+#endif
+    if (uart_share_ensure_installed(s_uart_num, UART_RX_BUFFER_SIZE, 0,
+                                    comm_uart_event_queue_size) == ESP_OK) {
         if (uart_share_acquire(s_uart_num, UART_SHARE_OWNER_DUALCOMM, pdMS_TO_TICKS(2000)) == ESP_OK) {
             s_comm_manager->uart_driver_installed = true;
         }
@@ -1453,12 +1595,12 @@ void esp_comm_manager_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud_r
 
     s_comm_manager->initialized = true;
 
-    const uint32_t rx_stack_bytes = 4096;
+    const uint32_t rx_stack_bytes = COMM_RX_TASK_STACK_BYTES;
     s_comm_manager->rx_task_res.stack = alloc_task_stack(rx_stack_bytes);
     s_comm_manager->rx_task_res.tcb = alloc_task_tcb();
     if (s_comm_manager->rx_task_res.stack && s_comm_manager->rx_task_res.tcb) {
         s_comm_manager->rx_task_handle = xTaskCreateStatic(rx_task, "comm_rx_task", rx_stack_bytes,
-                                                           s_comm_manager, 12,
+                                                           s_comm_manager, COMM_RX_TASK_PRIO,
                                                            s_comm_manager->rx_task_res.stack,
                                                            s_comm_manager->rx_task_res.tcb);
     }
@@ -1557,6 +1699,9 @@ bool esp_comm_manager_register_stream_handler(uint8_t channel, comm_stream_callb
 }
 
 bool esp_comm_manager_set_pins(gpio_num_t tx_pin, gpio_num_t rx_pin) {
+    if (comm_pins_conflict_with_rgb_display(tx_pin, rx_pin)) {
+        return false;
+    }
     if (!s_comm_manager || !s_comm_manager->initialized) {
         printf("E: Not initialized\n");
         return false;
@@ -1723,7 +1868,8 @@ bool esp_comm_manager_send_command(const char* command, const char* data) {
 
     size_t cmd_len = strlen(command);
     if (cmd_len > MAX_CMD_LEN) {
-        cmd_len = MAX_CMD_LEN;
+        printf("Command name too long; use command line transport\n");
+        return false;
     }
 
     strncpy((char*)packet.data, command, cmd_len);
@@ -1875,6 +2021,42 @@ bool esp_comm_manager_get_pins(gpio_num_t* tx_pin, gpio_num_t* rx_pin) {
     return true;
 }
 
+uint32_t esp_comm_manager_get_baud(void) {
+    return s_comm_manager ? s_comm_manager->baud_rate : 0;
+}
+
+bool esp_comm_manager_get_stats(esp_comm_manager_stats_t* out) {
+    if (!s_comm_manager || !out) {
+        return false;
+    }
+
+    esp_comm_manager_t* comm = s_comm_manager;
+    memset(out, 0, sizeof(*out));
+
+    out->tx_dropped_packets = comm->tx_dropped_packets;
+    out->rx_queue_dropped_packets = comm->rx_queue_dropped_packets;
+    out->rx_crc_error_count = comm->rx_crc_error_count;
+    out->stream_ignored_packets = comm->stream_ignored_packets;
+    out->rx_buffer_high_watermark = comm->rx_buffer_high_watermark;
+    out->rx_high_water_alerts = comm->rx_high_water_alerts;
+    out->rx_stack_size_bytes = COMM_RX_TASK_STACK_BYTES;
+    out->rx_buffer_size_bytes = UART_RX_BUFFER_SIZE;
+    if (comm->rx_task_handle) {
+        out->rx_task_ready = true;
+        // ESP-IDF reports the stack high-water mark in bytes.
+        out->rx_stack_min_free_bytes = uxTaskGetStackHighWaterMark(comm->rx_task_handle);
+    }
+    out->baud = comm->baud_rate;
+
+    if (comm->tx_queue) {
+        out->tx_queue_waiting = (unsigned)uxQueueMessagesWaiting(comm->tx_queue);
+    }
+    if (comm->rx_packet_queue) {
+        out->rx_queue_free = (unsigned)uxQueueSpacesAvailable(comm->rx_packet_queue);
+    }
+    return true;
+}
+
 void esp_comm_manager_disconnect(void) {
     if (s_comm_manager) {
         comm_state_t previous_state = s_comm_manager->state;
@@ -2021,6 +2203,18 @@ static void handle_connection_loss(esp_comm_manager_t* comm, const char* reason)
     }
     printf("Connection lost (%s)\n", reason ? reason : "unknown");
     terminal_view_add_text("W: Connection lost, restarting discovery\n");
+#ifdef CONFIG_HAS_MIC
+    bool mic_was_streaming = mic_visualizer_is_running();
+    unlock_state(comm);
+    if (mic_was_streaming) {
+        (void)mic_visualizer_stop();
+    }
+    lock_state(comm);
+    if (comm->state != COMM_STATE_CONNECTED) {
+        unlock_state(comm);
+        return;
+    }
+#endif
 
     comm->state = COMM_STATE_SCANNING;
     comm->remote_output_capture = false;

@@ -245,6 +245,20 @@ menu "Ghost ESP Options"
             depends on USE_ANALOG_JOYSTICK
             help
                 Swap up/down detection for the Y axis.
+
+        config USE_ATOMS3R_BUTTON
+            bool "Enable AtomS3R single-button navigation"
+            default n
+            depends on WITH_SCREEN
+            help
+                Enable the AtomS3R single-button navigation input.
+
+        config ATOMS3R_BUTTON_PIN
+            int "AtomS3R button GPIO"
+            default 41
+            depends on USE_ATOMS3R_BUTTON
+            help
+                GPIO connected to the AtomS3R user button.
                 
         config USE_IO_EXPANDER
             bool "Enable IO Expander (TCA9535)"

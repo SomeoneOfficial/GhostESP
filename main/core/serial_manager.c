@@ -5,6 +5,7 @@
 #include "driver/usb_serial_jtag.h"
 #include "esp_task_wdt.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -71,6 +72,10 @@ static TaskHandle_t s_serial_task_handle = NULL;
 static bool s_serial_initialized = false;
 static bool s_uart_disabled = false; // disable main serial UART for certain templates
 static bool s_uart_paused = false;   // temporarily hand the UART driver to another owner (e.g. GPS)
+#if defined(CONFIG_IS_S3TWATCH) && defined(CONFIG_PM_ENABLE)
+static esp_pm_lock_handle_t s_usb_sleep_lock = NULL;
+static bool s_usb_sleep_locked = false;
+#endif
 
 static bool serial_should_disable_uart(void) {
   return false;
@@ -145,8 +150,12 @@ typedef enum {
 
 static ir_capture_state_t ir_capture_state = IR_STATE_IDLE;
 static char *ir_capture_buffer = NULL;
-#define IR_CAPTURE_BUF_SIZE 2048
+// Large enough for a full raw Flipper .ir block (the whole "data:" timing
+// line arrives on one line and can be many KB).
+#define IR_CAPTURE_BUF_SIZE 8192
 static size_t ir_capture_pos = 0;
+
+#define IR_INLINE_CLOSE_MARKER "[IR/CLOSE]"
 #endif
 
 typedef enum {
@@ -587,6 +596,55 @@ static void display_prompt(void) {
     prompt_displayed = true;
 }
 
+// Parse the buffered inline IR payload, transmit it, then release the buffer.
+#if CONFIG_HAS_INFRARED
+static void ir_inline_finish(void) {
+    if (ir_capture_state == IR_STATE_CAPTURING && ir_capture_buffer) {
+        if (ir_capture_pos >= IR_CAPTURE_BUF_SIZE) {
+            ir_capture_pos = IR_CAPTURE_BUF_SIZE - 1;
+        }
+        ir_capture_buffer[ir_capture_pos] = '\0';
+        infrared_signal_t sig;
+        memset(&sig, 0, sizeof(sig));
+        if (infrared_manager_parse_buffer_single(ir_capture_buffer, &sig)) {
+            ghostchi_manager_add_xp(4);
+            bool ok = infrared_manager_transmit(&sig);
+            glog("IR: send %s\n", ok ? "OK" : "FAIL");
+            if (sig.is_raw) {
+                if (sig.payload.raw.timings && sig.payload.raw.timings_size > 0) {
+                    glog("IR: signal raw len=%u freq=%luHz duty=%.2f\n",
+                         (unsigned)sig.payload.raw.timings_size,
+                         (unsigned long)sig.payload.raw.frequency,
+                         (double)sig.payload.raw.duty_cycle);
+                }
+            } else {
+                const char *proto = sig.payload.message.protocol;
+                if (proto && proto[0] != '\0') {
+                    uint32_t addr = sig.payload.message.address;
+                    uint32_t cmd = sig.payload.message.command;
+                    if (sig.name[0] != '\0') {
+                        glog("IR: signal [%s] protocol=%s addr=0x%08lX cmd=0x%08lX\n",
+                             sig.name, proto, (unsigned long)addr, (unsigned long)cmd);
+                    } else {
+                        glog("IR: signal protocol=%s addr=0x%08lX cmd=0x%08lX\n",
+                             proto, (unsigned long)addr, (unsigned long)cmd);
+                    }
+                }
+            }
+            infrared_manager_free_signal(&sig);
+        } else {
+            glog("IR inline parse failed\n");
+        }
+    }
+    ir_capture_state = IR_STATE_IDLE;
+    ir_capture_pos = 0;
+    if (ir_capture_buffer) {
+        free(ir_capture_buffer);
+        ir_capture_buffer = NULL;
+    }
+}
+#endif
+
 // HTML marker processing and IR inline handling
 static void process_html_line(const char* line) {
 #if CONFIG_HAS_INFRARED
@@ -598,45 +656,7 @@ static void process_html_line(const char* line) {
     }
 
     if (strstr(line, "[IR/CLOSE]") != NULL) {
-        if (ir_capture_state == IR_STATE_CAPTURING) {
-            ir_capture_state = IR_STATE_IDLE;
-            if (ir_capture_pos >= IR_CAPTURE_BUF_SIZE) {
-                ir_capture_pos = IR_CAPTURE_BUF_SIZE - 1;
-            }
-            ir_capture_buffer[ir_capture_pos] = '\0';
-            infrared_signal_t sig;
-            memset(&sig, 0, sizeof(sig));
-            if (infrared_manager_parse_buffer_single(ir_capture_buffer, &sig)) {
-                ghostchi_manager_add_xp(4);
-                bool ok = infrared_manager_transmit(&sig);
-                glog("IR: send %s\n", ok ? "OK" : "FAIL");
-                if (sig.is_raw) {
-                    if (sig.payload.raw.timings && sig.payload.raw.timings_size > 0) {
-                        glog("IR: signal raw len=%u freq=%luHz duty=%.2f\n",
-                             (unsigned)sig.payload.raw.timings_size,
-                             (unsigned long)sig.payload.raw.frequency,
-                             (double)sig.payload.raw.duty_cycle);
-                    }
-                } else {
-                    const char *proto = sig.payload.message.protocol;
-                    if (proto && proto[0] != '\0') {
-                        uint32_t addr = sig.payload.message.address;
-                        uint32_t cmd = sig.payload.message.command;
-                        if (sig.name[0] != '\0') {
-                            glog("IR: signal [%s] protocol=%s addr=0x%08lX cmd=0x%08lX\n",
-                                 sig.name, proto, (unsigned long)addr, (unsigned long)cmd);
-                        } else {
-                            glog("IR: signal protocol=%s addr=0x%08lX cmd=0x%08lX\n",
-                                 proto, (unsigned long)addr, (unsigned long)cmd);
-                        }
-                    }
-                }
-                infrared_manager_free_signal(&sig);
-            } else {
-                glog("IR inline parse failed\n");
-            }
-        }
-        if (ir_capture_buffer) { free(ir_capture_buffer); ir_capture_buffer = NULL; }
+        ir_inline_finish();
         return;
     }
 
@@ -690,6 +710,11 @@ void serial_task(void *pvParameter) {
     return;
   }
   int index = 0;
+#if defined(CONFIG_IS_S3TWATCH) && defined(CONFIG_PM_ENABLE)
+  // USB Serial/JTAG cannot receive commands while the CPU is in light sleep.
+  ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "serial_usb",
+                                    &s_usb_sleep_lock));
+#endif
   static uint32_t hwm_log_counter = 0;
 
   // Display initial prompt after startup messages have time to print
@@ -701,6 +726,16 @@ void serial_task(void *pvParameter) {
 
   bool first_iteration = true;
   while (1) {
+#if defined(CONFIG_IS_S3TWATCH) && defined(CONFIG_PM_ENABLE)
+    bool usb_connected = usb_serial_jtag_is_connected();
+    if (usb_connected && !s_usb_sleep_locked) {
+      esp_pm_lock_acquire(s_usb_sleep_lock);
+      s_usb_sleep_locked = true;
+    } else if (!usb_connected && s_usb_sleep_locked) {
+      esp_pm_lock_release(s_usb_sleep_lock);
+      s_usb_sleep_locked = false;
+    }
+#endif
     // Ensure prompt is displayed on first iteration if it wasn't shown during init
     if (first_iteration && !s_uart_disabled && !prompt_displayed) {
       fflush(stdout);
@@ -746,6 +781,31 @@ void serial_task(void *pvParameter) {
 
       for (int i = 0; i < length; i++) {
         char incoming_char = (char)data[i];
+
+#if CONFIG_HAS_INFRARED
+        // While an [IR/BEGIN]..[IR/CLOSE] payload is streaming, buffer every byte
+        // verbatim. This bypasses the fixed-size serial line buffer so long raw
+        // .ir "data:" lines (sent by the Flipper app) are not truncated.
+        if (ir_capture_state == IR_STATE_CAPTURING) {
+          if (ir_capture_buffer && ir_capture_pos < IR_CAPTURE_BUF_SIZE - 1) {
+            ir_capture_buffer[ir_capture_pos++] = incoming_char;
+            const size_t close_len = sizeof(IR_INLINE_CLOSE_MARKER) - 1;
+            if (ir_capture_pos >= close_len &&
+                memcmp(ir_capture_buffer + ir_capture_pos - close_len,
+                       IR_INLINE_CLOSE_MARKER, close_len) == 0) {
+              ir_capture_pos -= close_len; // strip the marker itself
+              ir_inline_finish();
+            }
+          } else if (ir_capture_buffer) {
+            glog("IR inline payload too large; discarded\n");
+            ir_capture_state = IR_STATE_IDLE;
+            ir_capture_pos = 0;
+            free(ir_capture_buffer);
+            ir_capture_buffer = NULL;
+          }
+          continue;
+        }
+#endif
 
         if (process_rave_serial_byte((uint8_t)incoming_char)) {
           continue;
@@ -1059,6 +1119,16 @@ void serial_manager_deinit() {
     vTaskDelete(s_serial_task_handle);
     s_serial_task_handle = NULL;
   }
+#if defined(CONFIG_IS_S3TWATCH) && defined(CONFIG_PM_ENABLE)
+  if (s_usb_sleep_lock) {
+    if (s_usb_sleep_locked) {
+      esp_pm_lock_release(s_usb_sleep_lock);
+      s_usb_sleep_locked = false;
+    }
+    esp_pm_lock_delete(s_usb_sleep_lock);
+    s_usb_sleep_lock = NULL;
+  }
+#endif
 #if JTAG_SUPPORTED
   usb_serial_jtag_driver_uninstall();
 #endif
@@ -1080,14 +1150,22 @@ void serial_manager_restore_console(void) {
       .rx_buffer_size = BUF_SIZE,
       .tx_buffer_size = BUF_SIZE,
   };
-  esp_err_t ret = usb_serial_jtag_driver_install(&usb_serial_jtag_config);
-  if (ret != ESP_OK) {
-    ESP_LOGW("SerialManager",
-             "USB-JTAG restore skipped: %s (TinyUSB may still own the bus)",
-             esp_err_to_name(ret));
-  } else {
-    ESP_LOGI("SerialManager", "USB-JTAG restored after BadUSB teardown");
+  /* TinyUSB disconnect is asynchronous on the S3. Retry briefly so the
+   * console driver does not lose the race for the USB peripheral when a HID
+   * view is closed. Return immediately after the first successful install to
+   * avoid treating an already-restored driver as an error. */
+  esp_err_t ret = ESP_FAIL;
+  for (int attempt = 0; attempt < 5; attempt++) {
+    ret = usb_serial_jtag_driver_install(&usb_serial_jtag_config);
+    if (ret == ESP_OK) {
+      ESP_LOGI("SerialManager", "USB-JTAG restored after BadUSB teardown");
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
+  ESP_LOGW("SerialManager",
+           "USB-JTAG restore skipped: %s (TinyUSB may still own the bus)",
+           esp_err_to_name(ret));
 #endif
 }
 
@@ -1158,8 +1236,7 @@ int handle_serial_command(const char *input) {
         strcmp(actual_command, "badusb trackpad_stop") == 0 ||
         strcmp(actual_command, "badusb stop") == 0;
     if (!quiet_badusb_setting) {
-      glog("Received command from peer: %s\n", actual_command);
-      glog("Executing received command: %s\n", actual_command);
+      glog("Peer command: %s\n", actual_command);
     }
     if (handle_peer_badusb_trackpad_fast(actual_command)) {
       esp_comm_manager_set_remote_command_flag(false);
@@ -1208,7 +1285,7 @@ int handle_serial_command(const char *input) {
       *write++ = *p++;
     }
     if (quote != '\0') {
-      printf("Error: Missing closing quote\n");
+      glog("Error: Missing closing quote\n");
       return ESP_ERR_INVALID_ARG;
     }
     /* Advance past the delimiter before terminating the compacted token. If
@@ -1216,6 +1293,11 @@ int handle_serial_command(const char *input) {
     if (*p != '\0') p++;
     *write = '\0';
     while (isspace((unsigned char)*p)) p++;
+  }
+
+  if (*p != '\0') {
+    glog("Error: Too many command arguments (maximum 10)\n");
+    return ESP_ERR_INVALID_ARG;
   }
 
   if (argc == 0) {

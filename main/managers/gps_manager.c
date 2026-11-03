@@ -22,6 +22,7 @@
 #include "managers/rgb_manager.h"
 #include "vendor/GPS/minmea_soft.h"
 #include "driver/gpio.h"
+#include "i2c_shared.h"
 #include <esp_heap_caps.h>
 #include "esp_pm.h"
 #include "freertos/FreeRTOS.h"
@@ -45,6 +46,41 @@ static bool gps_soft_mode_active = false;
 static bool gps_soft_released_rgb_rmt = false;
 static bool gps_disabled_comm_for_conflict = false;
 static bool gps_released_serial_for_conflict = false;
+
+#ifdef CONFIG_IS_ATOMS3R
+static bool gps_released_grove_i2c = false;
+
+static void gps_restore_grove_i2c(void)
+{
+    if (!gps_released_grove_i2c) return;
+    i2c_master_bus_handle_t bus = NULL;
+    bool created = false;
+    esp_err_t ret = i2c_shared_get_or_create_bus(I2C_NUM_1, GPIO_NUM_2,
+                                                  GPIO_NUM_1, true,
+                                                  &bus, &created);
+    if (ret == ESP_OK) {
+        ESP_LOGI(GPS_TAG, "Restored Grove I2C bus 1 (SDA=2, SCL=1)%s",
+                 created ? " [created]" : "");
+        gps_released_grove_i2c = false;
+    } else {
+        ESP_LOGE(GPS_TAG, "Failed to restore Grove I2C: %s",
+                 esp_err_to_name(ret));
+    }
+}
+
+static void gps_release_grove_i2c_if_needed(uint8_t rx_pin)
+{
+    if (rx_pin != GPIO_NUM_2 || gps_released_grove_i2c) return;
+    esp_err_t ret = i2c_shared_release_bus(I2C_NUM_1);
+    if (ret == ESP_OK || ret == ESP_ERR_NOT_FOUND) {
+        gps_released_grove_i2c = true;
+        ESP_LOGI(GPS_TAG, "Released Grove I2C for GPS UART RX on GPIO2");
+    } else {
+        ESP_LOGE(GPS_TAG, "Could not release Grove I2C for GPS: %s",
+                 esp_err_to_name(ret));
+    }
+}
+#endif
 
 // Give the shared UART port back to the serial command interface if GPS took it
 // over (see the release in gps start). GPS owns the port via uart_share, so it
@@ -471,6 +507,25 @@ bool gps_manager_get_local_gps_snapshot(gps_t *out_gps) {
     return true;
 }
 
+bool gps_manager_get_wardrive_snapshot(gps_t *out_gps, bool *using_peer) {
+    if (!out_gps) return false;
+    taskENTER_CRITICAL(&gps_state_lock);
+    gps_t local = gps_local_snapshot;
+    bool local_ok = gps_last_update_tick != 0 &&
+                    xTaskGetTickCount() - gps_last_update_tick <= pdMS_TO_TICKS(GPS_STALE_UPDATE_TIMEOUT_MS) &&
+                    local.valid && local.fix >= GPS_FIX_GPS && local.fix_mode >= GPS_MODE_2D && local.sats_in_use >= 3;
+    bool peer_ok = gps_peer_last_update_tick != 0 &&
+                   xTaskGetTickCount() - gps_peer_last_update_tick <= pdMS_TO_TICKS(GPS_STALE_UPDATE_TIMEOUT_MS) &&
+                   gps_peer_fix_snapshot.valid && gps_peer_fix_snapshot.fix >= GPS_FIX_GPS &&
+                   gps_peer_fix_snapshot.fix_mode >= GPS_MODE_2D && gps_peer_fix_snapshot.sats_in_use >= 3;
+    bool use_peer = peer_ok && (gps_peer_preferred || !local_ok);
+    if (use_peer) *out_gps = gps_peer_fix_snapshot;
+    taskEXIT_CRITICAL(&gps_state_lock);
+    if (!use_peer && local_ok) *out_gps = local;
+    if (using_peer) *using_peer = use_peer;
+    return use_peer || local_ok;
+}
+
 bool gps_manager_get_active_gps_snapshot(gps_t *out_gps, bool *using_peer) {
     if (!out_gps) {
         return false;
@@ -760,6 +815,11 @@ void gps_manager_init(GPSManager *manager) {
         return;
     }
 
+#ifdef CONFIG_IS_ATOMS3R
+    /* GPIO2 is Grove SDA. GPS temporarily owns it as UART RX. */
+    gps_release_grove_i2c_if_needed(current_rx_pin);
+#endif
+
     glog("GPS RX: IO%d\n", current_rx_pin);
 
     bool preserve_dualcomm = gps_should_preserve_dualcomm();
@@ -904,6 +964,9 @@ void gps_manager_init(GPSManager *manager) {
             esp_comm_manager_init_with_defaults();
             gps_disabled_comm_for_conflict = false;
         }
+#ifdef CONFIG_IS_ATOMS3R
+        gps_restore_grove_i2c();
+#endif
         gps_lifecycle_end();
         return;
     }
@@ -1191,6 +1254,9 @@ void gps_manager_deinit(GPSManager *manager) {
     } else {
         status_display_show_status("GPS Not Init");
     }
+#ifdef CONFIG_IS_ATOMS3R
+    gps_restore_grove_i2c();
+#endif
     gps_lifecycle_end();
 }
 
@@ -1317,7 +1383,7 @@ static esp_err_t gps_manager_log_wardriving_data_impl(wardriving_data_t *data,
                      gps_get_absolute_year(gps.date.year), gps.date.month, gps.date.day, gps.fix,
                      gps.fix_mode, gps.sats_in_use);
         }
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
     }
 
     if (is_valid_date(&gps.date) && !has_valid_cached_date) {
@@ -1328,29 +1394,29 @@ static esp_err_t gps_manager_log_wardriving_data_impl(wardriving_data_t *data,
     if (!is_valid_time(&gps.tim)) {
         ESP_LOGW(GPS_TAG, "Invalid time: %02d:%02d:%02d", gps.tim.hour, gps.tim.minute,
                  gps.tim.second);
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
     }
 
     if (gps.latitude < -90.0 || gps.latitude > 90.0 || gps.longitude < -180.0 ||
         gps.longitude > 180.0) {
         ESP_LOGW(GPS_TAG, "Out-of-range coords: Lat=%f Lon=%f", gps.latitude, gps.longitude);
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
     }
 
     if (gps.speed < 0.0 || gps.speed > 340.0) {
         ESP_LOGW(GPS_TAG, "Out-of-range speed: %f m/s", gps.speed);
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
     }
 
     if (gps.dop_h < 0.0 || gps.dop_p < 0.0 || gps.dop_v < 0.0 || gps.dop_h > 50.0 ||
         gps.dop_p > 50.0 || gps.dop_v > 50.0) {
         ESP_LOGW(GPS_TAG, "Out-of-range DOP: H=%f P=%f V=%f", gps.dop_h, gps.dop_p, gps.dop_v);
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
     }
 
     if (data->latitude == 0.0 && data->longitude == 0.0) {
         ESP_LOGD(GPS_TAG, "Skipping log: final coordinates are (0,0)");
-        return ESP_OK;
+        return ESP_ERR_INVALID_STATE;
     }
 
     esp_err_t ret = csv_write_data_to_buffer(data);

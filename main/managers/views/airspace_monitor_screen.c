@@ -1,6 +1,7 @@
 #include "managers/views/airspace_monitor_screen.h"
 #include "core/callbacks.h"
 #include "core/ouis.h"
+#include "core/utils.h"
 #include "esp_timer.h"
 #include "gui/lvgl_safe.h"
 #include "gui/screen_layout.h"
@@ -105,6 +106,7 @@ static lv_obj_t *create_card_title(lv_obj_t *card, const char *text) {
 static void format_mac(const uint8_t mac[6], char *out, size_t out_size) {
     snprintf(out, out_size, "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    privacy_redact_mac(out);  /* display only; OUI retained for vendor lookup */
 }
 
 static uint32_t color_for_level(airspace_threat_level_t level) {
@@ -168,7 +170,7 @@ static void update_display_cb(lv_timer_t *timer) {
         lv_coord_t w = lv_obj_get_content_width(pps_line);
         lv_coord_t h = lv_obj_get_height(pps_line);
         if (w < 8) w = LV_HOR_RES - 16;  // layout not settled yet on first tick
-        if (h < 6) h = compact_layout() ? 24 : 40;
+        if (h < 6) h = tiny_layout() ? 20 : (compact_layout() ? 24 : 40);
         uint16_t maxv = snap.pps_history_max;
         if (maxv < 10) maxv = 10;  // floor so a quiet line stays near the bottom
         int32_t pad = (int32_t)AIRSPACE_PPS_HISTORY - (int32_t)snap.pps_history_count;
@@ -258,36 +260,36 @@ static void airspace_input_callback(InputEvent *event) {
                 return;  // drag was in progress or release-on-release was applied
             }
             if (!touch_moved) {
-                display_manager_switch_view(&main_menu_view);
+                display_manager_go_back();
             }
         }
     } else if (event->type == INPUT_TYPE_JOYSTICK || event->type == INPUT_TYPE_KEYBOARD) {
         if (event->type == INPUT_TYPE_JOYSTICK) {
             int button = event->data.joystick_index;
-            if (button == 2) scroll_airspace(1);
-            else if (button == 4) scroll_airspace(-1);
-            else if (button == 0 || button == 1 || button == 3) display_manager_switch_view(&main_menu_view);
+            if (button == 2) scroll_airspace(-1);
+            else if (button == 4) scroll_airspace(1);
+            else if (button == 0 || button == 1 || button == 3) display_manager_go_back();
             return;
         }
 
         int key = event->data.key_value;
         if (key == LV_KEY_UP || key == 'k' || key == ';') {
-            scroll_airspace(1);
-        } else if (key == LV_KEY_DOWN || key == 'j' || key == '.') {
             scroll_airspace(-1);
+        } else if (key == LV_KEY_DOWN || key == 'j' || key == '.') {
+            scroll_airspace(1);
         } else if (key == LV_KEY_ESC || key == 27 || key == 29 || key == '`' || key == 'q' || key == 'Q') {
-            display_manager_switch_view(&main_menu_view);
+            display_manager_go_back();
         }
     } else if (event->type == INPUT_TYPE_ENCODER) {
         if (event->data.encoder.button) {
-            display_manager_switch_view(&main_menu_view);
+            display_manager_go_back();
         } else if (event->data.encoder.direction > 0) {
             scroll_airspace(1);
         } else if (event->data.encoder.direction < 0) {
             scroll_airspace(-1);
         }
     } else if (event->type == INPUT_TYPE_EXIT_BUTTON) {
-        display_manager_switch_view(&main_menu_view);
+        display_manager_go_back();
     }
 }
 
@@ -358,23 +360,21 @@ void airspace_monitor_view_create(void) {
         lv_label_set_long_mode(lbl_counts_2, LV_LABEL_LONG_SCROLL_CIRCULAR);
     }
 
-    if (!tiny_layout()) {
-        pps_points = malloc(sizeof(lv_point_t) * AIRSPACE_PPS_HISTORY);
-        if (pps_points) {
-            memset(pps_points, 0, sizeof(lv_point_t) * AIRSPACE_PPS_HISTORY);
-            lv_obj_t *chart_card = create_card(content, 100);
-            if (!compact_layout()) {
-                create_card_title(chart_card, "Activity (pkt/s)");
-            }
-            pps_line = lv_line_create(chart_card);
-            lv_obj_set_width(pps_line, LV_PCT(100));
-            lv_obj_set_height(pps_line, compact_layout() ? 24 : 40);
-            lv_obj_set_style_line_width(pps_line, 2, 0);
-            lv_obj_set_style_line_color(pps_line, lv_color_hex(accent_color), 0);
-            lv_obj_set_style_line_rounded(pps_line, false, 0);
-            lv_obj_clear_flag(pps_line, LV_OBJ_FLAG_SCROLLABLE);
-            lv_line_set_points(pps_line, pps_points, AIRSPACE_PPS_HISTORY);
+    pps_points = malloc(sizeof(lv_point_t) * AIRSPACE_PPS_HISTORY);
+    if (pps_points) {
+        memset(pps_points, 0, sizeof(lv_point_t) * AIRSPACE_PPS_HISTORY);
+        lv_obj_t *chart_card = create_card(content, 100);
+        if (!compact_layout()) {
+            create_card_title(chart_card, "Activity (pkt/s)");
         }
+        pps_line = lv_line_create(chart_card);
+        lv_obj_set_width(pps_line, LV_PCT(100));
+        lv_obj_set_height(pps_line, tiny_layout() ? 20 : (compact_layout() ? 24 : 40));
+        lv_obj_set_style_line_width(pps_line, 2, 0);
+        lv_obj_set_style_line_color(pps_line, lv_color_hex(accent_color), 0);
+        lv_obj_set_style_line_rounded(pps_line, false, 0);
+        lv_obj_clear_flag(pps_line, LV_OBJ_FLAG_SCROLLABLE);
+        lv_line_set_points(pps_line, pps_points, AIRSPACE_PPS_HISTORY);
     }
 
     lv_obj_t *insight_card = create_card(content, 100);

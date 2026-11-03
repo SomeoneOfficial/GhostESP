@@ -744,6 +744,122 @@ static esp_err_t api_sd_card_upload_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+esp_err_t ap_manager_ensure_wifi_init(void) {
+    wifi_mode_t mode;
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (err == ESP_OK) {
+        return ESP_OK; // driver already initialized
+    }
+    if (err != ESP_ERR_WIFI_NOT_INIT) {
+        return err;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    err = esp_wifi_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Runtime radio config must never persist across reboots. Attacks switch
+    // mode/protocols for raw TX; with the default WIFI_STORAGE_FLASH a reboot
+    // mid-attack would reload that broken state from NVS and leave AP beacons
+    // invisible. RAM-only storage keeps NVS out of the picture entirely.
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to force RAM wifi storage: %s", esp_err_to_name(err));
+    }
+    return ESP_OK;
+}
+
+esp_err_t ap_manager_apply_attack_radio(void) {
+    // Attack profile = STA-only radio. Switching out of AP mode drops any
+    // WebUI/GhostNet client immediately AND removes the beacon, so nothing can
+    // re-associate mid-attack and lock the radio to one channel (#368).
+    // Raw injection still works from the STA interface while unassociated.
+    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (ret != ESP_OK) {
+        glog("WiFi mode set failed\n");
+        return ret;
+    }
+
+#if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
+    wifi_protocols_t p = {
+        .ghz_2g = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR,
+#if defined(CONFIG_IDF_TARGET_ESP32C5) /* C6 is 2.4GHz-only; no 5G protocols */
+        .ghz_5g = WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AC | WIFI_PROTOCOL_11AX,
+#endif
+    };
+    ret = esp_wifi_set_protocols(WIFI_IF_STA, &p);
+    if (ret != ESP_OK) {
+        printf("Warning: Failed to set attack protocols: %s\n", esp_err_to_name(ret));
+    }
+#else
+    (void)esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+#endif
+
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        glog("WiFi start failed\n");
+    } else {
+        printf("GhostNet AP off for attack (clients kicked)\n");
+    }
+    return ret;
+}
+
+wifi_interface_t ap_manager_get_tx_iface(void) {
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) == ESP_OK && mode == WIFI_MODE_STA) {
+        return WIFI_IF_STA;
+    }
+    return WIFI_IF_AP;
+}
+
+esp_err_t ap_manager_apply_normal_ap_profile(void) {
+    // be conservative for client compatibility (2.4GHz only, HT20)
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+    // IDF 6.x uses WIFI_BAND_MODE_AUTO on the C5. The singular
+    // esp_wifi_set_bandwidth() API rejects that mode, so configure both bands
+    // through the multi-band API instead.
+    wifi_bandwidths_t bandwidths = {
+        .ghz_2g = WIFI_BW20,
+        .ghz_5g = WIFI_BW20,
+    };
+    (void)esp_wifi_set_bandwidths(WIFI_IF_AP, &bandwidths);
+#else
+    (void)esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20);
+#endif
+
+#if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
+    // No LR anywhere in the normal profile; a persisted LR config makes AP
+    // beacons invisible to regular clients.
+    wifi_protocols_t p = {
+        .ghz_2g = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N,
+#if defined(CONFIG_IDF_TARGET_ESP32C5) /* C6 is 2.4GHz-only; no 5G protocols */
+        .ghz_5g = WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AC | WIFI_PROTOCOL_11AX,
+#endif
+    };
+    return esp_wifi_set_protocols(WIFI_IF_AP, &p);
+#else
+    return esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+#endif
+}
+
+bool ap_manager_restore_after_attack(const char *who) {
+    esp_err_t err = ap_manager_start_services();
+    if (err == ESP_OK) {
+        return true;
+    }
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        glog("%s: AP services not restored (disabled or power saving on)\n",
+             who ? who : "restore");
+    } else {
+        glog("%s: failed to restore AP services: %s\n", who ? who : "restore",
+             esp_err_to_name(err));
+    }
+    return false;
+}
+
 esp_err_t ap_manager_init(void) {
     esp_err_t ret;
     wifi_mode_t mode;
@@ -752,6 +868,16 @@ esp_err_t ap_manager_init(void) {
     // default AP to OFF on first boot (when key not present in NVS)
 #if defined(CONFIG_IDF_TARGET_ESP32C5) && defined(CONFIG_BUILD_CONFIG_TEMPLATE)
     if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0) {
+        if (!settings_ap_enabled_key_exists()) {
+            G_Settings.ap_enabled = false;
+        }
+    }
+#endif
+
+    // Default override: GhostLink P1 peer (ESP32-C3) also defaults AP to OFF
+    // on first boot (when key not present in NVS)
+#if defined(CONFIG_IDF_TARGET_ESP32C3) && defined(CONFIG_BUILD_CONFIG_TEMPLATE)
+    if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "ghostlink_p1_peer") == 0) {
         if (!settings_ap_enabled_key_exists()) {
             G_Settings.ap_enabled = false;
         }
@@ -767,7 +893,7 @@ esp_err_t ap_manager_init(void) {
 
     // Check if AP is disabled in settings
     if (!settings_get_ap_enabled(&G_Settings)) {
-        glog("Access Point disabled in settings, skipping AP initialization\n");
+        glog("Access point: off\n");
         return ESP_OK;
     }
 
@@ -775,8 +901,7 @@ esp_err_t ap_manager_init(void) {
     if (ret == ESP_ERR_WIFI_NOT_INIT) {
         glog("Wi-Fi not initialized, initializing as Access Point...\n");
 
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        ret = esp_wifi_init(&cfg);
+        ret = ap_manager_ensure_wifi_init();
         if (ret != ESP_OK) {
             glog("esp_wifi_init failed: %s\n", esp_err_to_name(ret));
             return ret;
@@ -812,6 +937,14 @@ esp_err_t ap_manager_init(void) {
     if (ret != ESP_OK) {
         glog("esp_wifi_set_mode failed: %s\n", esp_err_to_name(ret));
         return ret;
+    }
+
+    // Re-assert the normal radio profile every boot. This heals devices that
+    // carry an attack-time config (plain AP mode, LR/11AX protocols) persisted
+    // by older builds, which made beacons invisible after reboot.
+    ret = ap_manager_apply_normal_ap_profile();
+    if (ret != ESP_OK) {
+        glog("Failed to apply normal AP profile: %s\n", esp_err_to_name(ret));
     }
 
     const char *ssid = strlen(settings_get_ap_ssid(&G_Settings)) > 0
@@ -921,9 +1054,14 @@ esp_err_t ap_manager_init(void) {
 // Deinitialize and stop the servers
 void ap_manager_deinit(void) {
     ESP_LOGI(TAG, "Deinitializing AP Manager");
-    
+
     stop_http_server();
     reset_server_config();
+
+    // Quiesce mDNS BEFORE the WiFi driver goes down: a pending responder
+    // announce/probe fired after esp_wifi_stop() crashes in the WiFi ROM
+    // (LoadProhibited in ieee80211_search_node on tcpip_thread).
+    teardown_mdns();
 
     {
         esp_err_t err_reg = esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler);
@@ -951,9 +1089,7 @@ void ap_manager_deinit(void) {
         esp_netif_destroy(netif);
         netif = NULL;
     }
-    
-    teardown_mdns();
-    
+
     ESP_LOGI(TAG, "AP Manager deinitialized successfully");
 }
 
@@ -970,7 +1106,8 @@ esp_err_t ap_manager_start_services() {
         status_display_show_status("AP Disabled");
         // make sure services are stopped if they somehow started and conditions changed
         ap_manager_stop_services();
-        return ESP_OK;
+        // Report the skip so callers don't mistake it for a successful restore.
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
     // Set Wi-Fi mode to AP
@@ -978,6 +1115,13 @@ esp_err_t ap_manager_start_services() {
     if (ret != ESP_OK) {
         glog("WiFi mode set failed\n");
         return ret;
+    }
+
+    // Undo any attack-time radio config (LR protocols etc.) so beacons are
+    // visible to regular clients again, then start Wi-Fi.
+    ret = ap_manager_apply_normal_ap_profile();
+    if (ret != ESP_OK) {
+        glog("Failed to apply normal AP profile: %s\n", esp_err_to_name(ret));
     }
 
     // Start Wi-Fi
@@ -1327,6 +1471,15 @@ static esp_err_t api_command_handler(httpd_req_t *req) {
     }
 
     const char *command = command_json->valuestring;
+    // SerialCommand has 256 bytes including its NUL terminator.
+    if (!command[0] || strlen(command) > 255 || strchr(command, '\n') || strchr(command, '\r')) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "Use one command of 1-255 UTF-8 bytes");
+        cJSON_Delete(json);
+        free(content);
+        return ESP_FAIL;
+    }
+
 
     // Add command to log buffer
     char cmd_log[1024];
@@ -1335,7 +1488,7 @@ static esp_err_t api_command_handler(httpd_req_t *req) {
 
     simulateCommand(command);
 
-    httpd_resp_send(req, "Command executed", strlen("Command executed"));
+    httpd_resp_sendstr(req, "Command queued");
 
     cJSON_Delete(json);
     free(content);
@@ -1570,6 +1723,25 @@ static esp_err_t api_settings_handler(httpd_req_t *req) {
         settings_set_display_timeout(settings, display_timeout->valueint);
         ESP_LOGI(TAG, "Setting display timeout to: %d ms", display_timeout->valueint);
     }
+
+    // GhostLink (ESP comm) TX/RX pins. Persist them so they survive reboots.
+    // -1 is the "not used / disabled" sentinel (boards whose shared pins are
+    // otherwise claimed); a live re-pin while connected/scanning is disruptive,
+    // so these are staged and applied on the next comm manager init.
+    cJSON *esp_comm_tx_pin = cJSON_GetObjectItem(root, "esp_comm_tx_pin");
+    cJSON *esp_comm_rx_pin = cJSON_GetObjectItem(root, "esp_comm_rx_pin");
+    if (esp_comm_tx_pin && esp_comm_rx_pin) {
+        int32_t comm_tx = esp_comm_tx_pin->valueint;
+        int32_t comm_rx = esp_comm_rx_pin->valueint;
+        if ((comm_tx < -1 || comm_tx > 48) || (comm_rx < -1 || comm_rx > 48)) {
+            cJSON_Delete(root);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"error\": \"esp_comm pins must be -1 or 0-48.\"}");
+            return ESP_FAIL;
+        }
+        settings_set_esp_comm_pins(settings, comm_tx, comm_rx);
+    }
     glog("About to Save Settings\n");
 
     esp_err_t save_err = settings_save(settings);
@@ -1768,15 +1940,26 @@ static esp_err_t api_esp_comm_control_handler(httpd_req_t *req) {
 // Handler for sending ESP communication commands
 static esp_err_t api_esp_comm_send_handler(httpd_req_t *req) {
     WEBUI_GUARD_OR_RETURN(req);
-    char content[512];
-    int ret = httpd_req_recv(req, content, MIN_(req->content_len, sizeof(content) - 1));
-    if (ret <= 0) {
+    // A 250-byte command can occupy 1500 JSON bytes when escaped.
+    char content[1536];
+    if (req->content_len >= sizeof(content)) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Command payload too large\"}");
+        return ESP_FAIL;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int count = httpd_req_recv(req, content + received, req->content_len - received);
+        if (count <= 0) break;
+        received += (size_t)count;
+    }
+    if (received != req->content_len || received == 0) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_sendstr(req, "{\"error\": \"Invalid request payload\"}");
         return ESP_FAIL;
     }
     
-    content[ret] = '\0';
+    content[received] = '\0';
     
     cJSON *json = cJSON_Parse(content);
     if (!json) {
@@ -1793,8 +1976,20 @@ static esp_err_t api_esp_comm_send_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    // Send the full command string as-is (no separate data field needed)
-    bool success = esp_comm_manager_send_command(command->valuestring, NULL);
+    size_t command_len = strlen(command->valuestring);
+    if (command_len == 0 || command_len > 250 ||
+        strchr(command->valuestring, '\n') || strchr(command->valuestring, '\r')) {
+        cJSON_Delete(json);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Use one command of 1-250 UTF-8 bytes\"}");
+        return ESP_FAIL;
+    }
+    // The stream transport splits the verb and arguments on the peer.
+    // The packet command-name field is only 32 bytes, not a full command line.
+    char command_log[280];
+    snprintf(command_log, sizeof(command_log), "> [peer] %s\n", command->valuestring);
+    ap_manager_add_log(command_log);
+    bool success = esp_comm_manager_send_command_line(command->valuestring);
     
     cJSON *response = cJSON_CreateObject();
     cJSON_AddBoolToObject(response, "success", success);

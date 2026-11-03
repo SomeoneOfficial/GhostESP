@@ -48,6 +48,10 @@ bool wardriving_get_helper_channel_plan_csv(char *out, size_t out_len);
 bool wardriving_set_helper_channels_from_csv(const char *csv);
 void wardriving_set_helper_hop_ms(uint16_t ms);
 void wardriving_set_helper_weighted_5g(bool enabled);
+bool wardriving_set_primary_channels_from_csv(const char *csv);
+bool wardriving_start_peer_helper(void);
+bool wardriving_set_active_scan(bool enabled);
+bool wardriving_is_running(void);
 
 uint32_t wardriving_get_ap_count(void);
 
@@ -64,9 +68,14 @@ void wifi_raw_scan_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 typedef void (*wifi_raw_observer_t)(const wifi_promiscuous_pkt_t *pkt,
                                     wifi_promiscuous_pkt_type_t type);
 void wifi_raw_set_observer(wifi_raw_observer_t observer);
+/* Frames the capture queue could not accept, broken down by why. Reset with
+ * pcap_reset_queue_drop_stats() when a capture starts. */
+void pcap_get_queue_drop_stats(uint32_t *too_big, uint32_t *no_slot,
+                               uint32_t *queue_full);
+void pcap_reset_queue_drop_stats(void);
 void wifi_eapol_scan_callback(void *buf, wifi_promiscuous_pkt_type_t type);
 void wardriving_scan_callback(void *buf, wifi_promiscuous_pkt_type_t type);
-#ifndef CONFIG_IDF_TARGET_ESP32S2
+#if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(GHOSTESP_NO_NATIVE_BLE)
 #include "host/ble_gap.h"
 void ble_wardriving_callback(struct ble_gap_event *event, void *arg);
 void ble_skimmer_scan_callback(struct ble_gap_event *event, void *arg);
@@ -92,7 +101,6 @@ typedef struct {
 } wps_network_t;
 
 extern gps_t *gps;
-extern wps_network_t detected_wps_networks[MAX_WPS_NETWORKS];
 extern int detected_network_count;
 extern esp_timer_handle_t stop_timer;
 extern int should_store_wps;
@@ -107,5 +115,7 @@ void cleanup_pcap_queue(void);
 uint32_t wifi_callbacks_get_handshake_count(void);
 void wifi_callbacks_reset_handshake_tracking(void);
 void wifi_callbacks_set_pcap_enabled(bool enabled);
+void wifi_callbacks_monitor_tables_ensure(void);
+void wifi_callbacks_monitor_tables_release(void);
 
 #endif

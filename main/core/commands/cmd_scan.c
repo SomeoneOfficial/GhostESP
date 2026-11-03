@@ -10,13 +10,13 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "managers/ap_manager.h"
 #include "managers/ble_manager.h"
 #include "managers/gps_manager.h"
 #include "managers/sd_card_manager.h"
 #include "managers/status_display_manager.h"
 #include "managers/wifi_manager.h"
 #include "managers/zigbee_manager.h"
+#include "scans/wifi/station_scan.h"
 #include "sdkconfig.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -38,6 +38,16 @@ static const char* sweep_get_auth_str(wifi_auth_mode_t auth);
 static const char* sweep_get_cipher_str(wifi_cipher_type_t cipher);
 static void sweep_get_phy_modes(wifi_ap_record_t *ap, char *buf, size_t len);
 static void sweep_write_csv_escaped(FILE *f, const char *str);
+
+static void sweep_refresh_timestamp(char *out, size_t out_len) {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    if (tm_info && tm_info->tm_year >= 120) {
+        strftime(out, out_len, "%Y-%m-%d %H:%M:%S", tm_info);
+    } else {
+        out[0] = '\0';
+    }
+}
 
 void sweep_clear_result(void) {
     memset(&g_sweep_result, 0, sizeof(g_sweep_result));
@@ -110,6 +120,7 @@ static void sweep_run_internal(void) {
         else secure_networks++;
 
         if (report) {
+            sweep_refresh_timestamp(timestamp, sizeof(timestamp));
             fprintf(report, "WiFi AP,");
             sweep_write_csv_escaped(report, ssid_safe);
             fprintf(report, ",%02X:%02X:%02X:%02X:%02X:%02X,,%d,%d,%d,%s,%s,%s,%s,",
@@ -139,6 +150,7 @@ static void sweep_run_internal(void) {
 
     for (int i = 0; i < station_count; i++) {
         if (report) {
+            sweep_refresh_timestamp(timestamp, sizeof(timestamp));
             fprintf(report, "WiFi Client,,%02X:%02X:%02X:%02X:%02X:%02X,%02X:%02X:%02X:%02X:%02X:%02X,,,,,,,",
                     station_ap_list[i].station_mac[0], station_ap_list[i].station_mac[1],
                     station_ap_list[i].station_mac[2], station_ap_list[i].station_mac[3],
@@ -154,7 +166,7 @@ static void sweep_run_internal(void) {
         }
     }
 
-#ifndef CONFIG_IDF_TARGET_ESP32S2
+#if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(GHOSTESP_NO_NATIVE_BLE)
     // --- BLE Scans ---
     g_sweep_result.current_phase = 3;
     glog("\n--- Phase 3: BLE Flipper Scan (%ds) ---\n", ble_seconds);
@@ -173,6 +185,7 @@ static void sweep_run_internal(void) {
         int8_t rssi;
         char name[32];
         if (flipper_scan_get_device_data(i, mac, &rssi, name, sizeof(name)) == 0) {
+            sweep_refresh_timestamp(timestamp, sizeof(timestamp));
             fprintf(report, "Flipper,");
             sweep_write_csv_escaped(report, name[0] ? name : "");
             fprintf(report, ",%02X:%02X:%02X:%02X:%02X:%02X,,,,%d,,,,",
@@ -202,6 +215,7 @@ static void sweep_run_internal(void) {
         int8_t rssi;
         char name[32];
         if (ble_get_gatt_device_data(i, mac, &rssi, name, sizeof(name)) == 0) {
+            sweep_refresh_timestamp(timestamp, sizeof(timestamp));
             fprintf(report, "BLE Device,");
             sweep_write_csv_escaped(report, name[0] ? name : "");
             fprintf(report, ",%02X:%02X:%02X:%02X:%02X:%02X,,,,%d,,,,",
@@ -240,6 +254,7 @@ static void sweep_run_internal(void) {
     for (int i = 0; i < zb_cnt && report; i++) {
         zigbee_device_t dev;
         if (zigbee_manager_get_device_data(i, &dev) == 0) {
+            sweep_refresh_timestamp(timestamp, sizeof(timestamp));
             fprintf(report, "802.15.4,");
             if (dev.addr_len == 8) {
                 fprintf(report, ",%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X,,%d,,%d,,,,",
@@ -264,7 +279,7 @@ static void sweep_run_internal(void) {
         glog("\nReport saved to: %s\n", report_path);
     }
 
-    ap_manager_start_services();
+    // station_scan_stop() owns AP/STA restoration after the station phase.
     glog("\n=== Sweep Complete ===\n");
     glog("WiFi: %d APs, %d stations | Security: %d open, %d weak, %d secure\n",
          ap_cnt, station_count, open_networks, weak_networks, secure_networks);
@@ -275,7 +290,7 @@ static void sweep_run_internal(void) {
 static void sweep_task(void *pvParameters) {
     (void)pvParameters;
     sweep_run_internal();
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 void sweep_start_async(int wifi_seconds, int ble_seconds) {
@@ -321,13 +336,32 @@ void handle_scanall(int argc, char **argv) {
 
     // 1. Perform AP Scan
     glog("--- Starting AP Scan (%d seconds) ---\n", ap_scan_seconds);
-    wifi_manager_start_scan_with_time(ap_scan_seconds);
+    esp_err_t ap_scan_err = wifi_manager_start_scan_with_time(ap_scan_seconds);
+    if (ap_scan_err != ESP_OK) {
+        glog("AP scan failed: %s\n", esp_err_to_name(ap_scan_err));
+        status_display_show_status("Scan Failed");
+        return;
+    }
     // Results are now in scanned_aps and ap_count
+
+    uint16_t ap_count = 0;
+    wifi_ap_record_t *aps = NULL;
+    wifi_manager_get_scan_results_data(&ap_count, &aps);
+    if (ap_count == 0 || aps == NULL) {
+        glog("No AP results available for station scan.\n");
+        status_display_show_status("Scan Failed");
+        return;
+    }
 
     // 2. Perform Station Scan
     glog("--- Starting Station Scan (%d seconds) ---\n", sta_scan_seconds);
     station_count = 0; // Reset station list before new scan
     wifi_manager_start_station_scan(); // Starts monitor mode + channel hopping
+    if (!station_scan_is_active()) {
+        glog("Station scan failed to start.\n");
+        status_display_show_status("Scan Failed");
+        return;
+    }
     glog("Station scan running for %d seconds...\n", sta_scan_seconds);
     vTaskDelay(pdMS_TO_TICKS(sta_scan_seconds * 1000));
     wifi_manager_stop_monitor_mode(); // Stops monitor mode + channel hopping
@@ -338,7 +372,7 @@ void handle_scanall(int argc, char **argv) {
     // 3. Print Combined Results
     wifi_manager_scanall_chart();
 
-    ap_manager_start_services();
+    // station_scan_stop() restores GhostNet after the station phase.
     status_display_show_status("ScanAll Done");
 }
 

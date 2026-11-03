@@ -13,6 +13,7 @@
 #include "core/glog.h"
 #include "core/commands.h"
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -120,7 +121,7 @@ static bool nfc_cli_init_st25r(nfc_cli_ctx_t *ctx) {
         (gpio_num_t)CONFIG_NFC_SCL_PIN,
         (gpio_num_t)CONFIG_NFC_RST_PIN,
         (gpio_num_t)CONFIG_NFC_IRQ_PIN,
-        I2C_NUM_0,
+        CONFIG_NFC_ST25R3916_I2C_PORT,
         CONFIG_NFC_ST25R3916_I2C_ADDR,
         ctx->nfc);
 #endif
@@ -770,7 +771,7 @@ typedef struct {
 } nfc_trace_rec_t;
 
 #define NFC_TRACE_MAX 96
-static nfc_trace_rec_t s_nfc_trace[NFC_TRACE_MAX];
+EXT_RAM_BSS_ATTR static nfc_trace_rec_t s_nfc_trace[NFC_TRACE_MAX];
 static int s_nfc_trace_n;
 
 /* Inline per-state-change logging is a SYNCHRONOUS UART printf (~3.5ms/line).

@@ -9,6 +9,7 @@
 #include "lvgl.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -16,7 +17,11 @@
 typedef struct {
     void (*fn)(void *ctx);
     void *ctx;
-    SemaphoreHandle_t done;
+    /* The task waiting for this call. A direct task notification is stored in
+       the waiter's own TCB, so the wait is per-calling-task and needs no
+       allocation of its own - unlike a per-call semaphore, which allocated and
+       freed a FreeRTOS object on every single UI call. */
+    TaskHandle_t task;
 } plugin_ui_sync_call_t;
 
 typedef struct {
@@ -49,7 +54,10 @@ const char *plugin_api_internal_app_id(void);
 bool plugin_api_internal_run_sync(void (*fn)(void *ctx), void *ctx);
 /* Queues fn on the UI task without waiting for it. Runs inline when the
    caller is already the UI task. fn owns ctx and must free it. */
-void plugin_api_internal_run_async(void (*fn)(void *ctx), void *ctx);
+bool plugin_api_internal_run_async(void (*fn)(void *ctx), void *ctx);
+/* Non-blocking version for frame producers that can safely drop a frame when
+   LVGL is already rendering. */
+bool plugin_api_internal_run_async_nowait(void (*fn)(void *ctx), void *ctx);
 lv_obj_t *plugin_api_internal_parent_or_current(ghostesp_ui_obj_t parent);
 void plugin_api_canvas_cleanup_timers(void);
 

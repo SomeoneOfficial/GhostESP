@@ -6,24 +6,23 @@ weight: 20
 
 BadUSB runs scripts from the SD card as a USB HID keyboard. Scripts live in `/mnt/ghostesp/badusb/`.
 
-For other USB features, see [Mouse Jiggler]({{< relref "mouse-jiggler.md" >}}) and [USB Keyboard Mode]({{< relref "usb-keyboard-mode.md" >}}).
-
 ## Supported Devices
 
 **Note:** Configs with VSENSE support will wait for a USB connection before starting the script.
 
 With VSENSE support:
-- The Wired Hatters Banshee
+- The Wired Hatters Banshee **S3**
 
 Without VSENSE support:
 - Cardputer
 - Cardputer ADV
-- LilyGo T-Deck/T-Deck Plus
-- Banshee S3 (`Banshee_S3` build; S3 worker paired with the C5 display)
+- CrowPanel 1.28" Rotary
+- LilyGo T-Dongle-S3
+- LilyGo TEmbed C1101
+
+**Note:** The Banshee **C5** is a remote-HID build. It has no local BadUSB and instead drives BadUSB on a paired S3 over GhostLink. VSENSE (wait-for-USB) is present only on the Banshee **S3**.
 
 ## Supported DuckyScript Commands
-
-Supported DuckyScript commands:
 
 - `REM`
 - `DEFAULT_DELAY` / `DEFAULTDELAY`
@@ -36,7 +35,7 @@ Supported DuckyScript commands:
 ## Script Files
 
 - Place scripts in `/mnt/ghostesp/badusb/`
-- File extension: `.txt` (only `.txt` files are listed)
+- File extension: `.txt` (only `.txt` files from the SD card are listed; the built-in script is always listed first)
 - Remote streaming size limit: 64 KB per script
 - SD card must be inserted and mounted to list or run scripts
 
@@ -48,10 +47,12 @@ Script commands:
 
 ```
 badusb list
-badusb run <filename>
+badusb run <filename|builtin>
 badusb stop
 badusb exec <size>
 ```
+
+`badusb run builtin` runs the built-in **"Ghost Art (Built-in)"** script, which opens Notepad and types ASCII art. The built-in entry is always listed first by `badusb list` and does not need to exist on the SD card.
 
 Settings (applies to the next run):
 

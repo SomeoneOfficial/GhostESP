@@ -12,13 +12,28 @@
 #define TOAST_QUEUE_SIZE   1
 #define TOAST_SLIDE_IN_MS  250
 #define TOAST_SLIDE_OUT_MS 200
+#ifdef CONFIG_CROWPANEL_ADVANCED_P4
+#define TOAST_MIN_HEIGHT   48
+#define TOAST_RADIUS       GUI_RADIUS_SM
+#define TOAST_PAD_H        16
+#define TOAST_PAD_V        10
+#define TOAST_ICON_GAP     10
+#define TOAST_Y_TARGET     (GUI_STATUS_BAR_H + 4)
+#elif defined(CONFIG_CROWPANEL_1P28_ROTARY)
+#define TOAST_MIN_HEIGHT   32
+#define TOAST_RADIUS       16
+#define TOAST_PAD_H        10
+#define TOAST_PAD_V        6
+#define TOAST_ICON_GAP     6
+#define TOAST_Y_TARGET     56
+#else
 #define TOAST_MIN_HEIGHT   32
 #define TOAST_RADIUS       8
 #define TOAST_PAD_H        10
 #define TOAST_PAD_V        6
 #define TOAST_ICON_GAP     6
-#define TOAST_STATUS_BAR_H 20
-#define TOAST_Y_TARGET     (TOAST_STATUS_BAR_H + 4)
+#define TOAST_Y_TARGET     24
+#endif
 
 typedef struct {
     char text[TOAST_MAX_TEXT_LEN + 1];
@@ -118,8 +133,15 @@ static void toast_ensure_objects(void) {
 
     s_container = lv_obj_create(parent);
     lv_obj_remove_style_all(s_container);
-    lv_obj_set_size(s_container, LV_HOR_RES - GUI_SAFEAREA_HOR * 2, TOAST_MIN_HEIGHT);
-    lv_obj_set_pos(s_container, GUI_SAFEAREA_HOR, offscreen_y());
+#ifdef CONFIG_CROWPANEL_1P28_ROTARY
+    const lv_coord_t toast_width = 176;
+    const lv_coord_t toast_x = (LV_HOR_RES - toast_width) / 2;
+#else
+    const lv_coord_t toast_width = LV_HOR_RES - GUI_SAFEAREA_HOR * 2;
+    const lv_coord_t toast_x = GUI_SAFEAREA_HOR;
+#endif
+    lv_obj_set_size(s_container, toast_width, TOAST_MIN_HEIGHT);
+    lv_obj_set_pos(s_container, toast_x, offscreen_y());
     lv_obj_clear_flag(s_container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_bg_opa(s_container, LV_OPA_COVER, 0);
@@ -140,7 +162,7 @@ static void toast_ensure_objects(void) {
 
     s_inner = lv_obj_create(s_container);
     lv_obj_remove_style_all(s_inner);
-    lv_obj_set_size(s_inner, LV_HOR_RES - GUI_SAFEAREA_HOR * 2 - 3 - TOAST_PAD_H * 2, TOAST_MIN_HEIGHT);
+    lv_obj_set_size(s_inner, toast_width - 3 - TOAST_PAD_H * 2, TOAST_MIN_HEIGHT);
     lv_obj_align(s_inner, LV_ALIGN_LEFT_MID, 3 + TOAST_PAD_H, 0);
     lv_obj_set_flex_flow(s_inner, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_inner, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -148,10 +170,10 @@ static void toast_ensure_objects(void) {
     lv_obj_clear_flag(s_inner, LV_OBJ_FLAG_SCROLLABLE);
 
     s_icon = lv_label_create(s_inner);
-    lv_obj_set_style_text_font(s_icon, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_icon, gui_font_caption(), 0);
 
     s_label = lv_label_create(s_inner);
-    lv_obj_set_style_text_font(s_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_label, gui_font_body(), 0);
     lv_label_set_long_mode(s_label, LV_LABEL_LONG_WRAP);
 }
 
@@ -213,7 +235,7 @@ static void toast_present_next(void) {
     if (text_w < 40) text_w = 40;
     lv_obj_set_width(s_label, text_w);
 
-    const lv_font_t *font = &lv_font_montserrat_12;
+    const lv_font_t *font = gui_font_body();
     lv_point_t txt_size;
     lv_txt_get_size(&txt_size, slot.text, font,
                     lv_obj_get_style_text_letter_space(s_label, 0),
@@ -325,7 +347,9 @@ static void toast_post(const char *text, uint8_t type, uint16_t duration_ms) {
     a->type = type;
     a->duration_ms = duration_ms > 0 ? duration_ms : TOAST_DEFAULT_DURATION_MS;
 
-    display_manager_run_on_lvgl(toast_async_cb, a);
+    if (!display_manager_run_on_lvgl(toast_async_cb, a)) {
+        free(a);
+    }
 }
 
 void toast_show(const char *text, uint8_t type) {

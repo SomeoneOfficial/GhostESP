@@ -1,7 +1,10 @@
+#include "managers/views/file_browser.h"
 #include "managers/views/subghz_view.h"
 #include "sdkconfig.h"
 #include "esp_attr.h"
 #include "gui/design_tokens.h"
+#include "gui/touch_bar.h"
+#include "gui/gui_router.h"
 
 #if defined(CONFIG_HAS_SUBGHZ) || defined(CONFIG_HAS_SUBGHZ_REMOTE)
 
@@ -60,8 +63,7 @@
 #endif
 
 #ifdef CONFIG_USE_TOUCHSCREEN
-#define SUBGHZ_SCROLL_BTN_SIZE 28
-#define SUBGHZ_SCROLL_BTN_PADDING 3
+/* Touch bar sizing now owned by gui/touch_bar.h (GUI_TOUCH_BAR_*). */
 #if CONFIG_LV_TOUCH_CONTROLLER_XPT2046
 static const int SUBGHZ_SWIPE_THRESHOLD_RATIO = 1;
 #else
@@ -130,6 +132,7 @@ static lv_obj_t *s_back_row = NULL;
 static lv_obj_t *s_scroll_up_btn = NULL;
 static lv_obj_t *s_scroll_down_btn = NULL;
 static lv_obj_t *s_back_btn = NULL;
+static gui_touch_bar_t s_touch_tb = {0};
 static touch_drag_t s_touch_drag = {0};
 #endif
 
@@ -273,6 +276,7 @@ static subghz_decoded_signal_t s_remote_decoded = {0};
 #define SUBGHZ_CAPTURE_SIGNAL_THRESHOLD 65
 #define SUBGHZ_CAPTURE_SIGNAL_HITS      2
 #define SUBGHZ_SNAPSHOT_DIR             "/mnt/ghostesp/subghz"
+static char s_saved_browse_dir[FILE_BROWSER_PATH_MAX] = SUBGHZ_SNAPSHOT_DIR;
 #define SUBGHZ_SNAPSHOT_EXT             ".sub"
 
 static bool s_remote_mode = false;
@@ -654,29 +658,21 @@ static bool subghz_sd_begin(bool *display_was_suspended) {
         *display_was_suspended = false;
     }
 
-#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
-    if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0 ||
-        strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething2") == 0) {
+    if (sd_card_needs_jit_mount()) {
         esp_err_t mount_err = sd_card_mount_for_flush(display_was_suspended);
         if (mount_err != ESP_OK) {
             return false;
         }
         (void)sd_card_setup_directory_structure();
     }
-#endif
 
     return true;
 }
 
 static void subghz_sd_end(bool display_was_suspended) {
-#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
-    if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0 ||
-        strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething2") == 0) {
+    if (sd_card_needs_jit_mount()) {
         sd_card_unmount_after_flush(display_was_suspended);
     }
-#else
-    (void)display_was_suspended;
-#endif
 }
 
 static bool subghz_local_save_snapshot(const char *name_hint,
@@ -851,23 +847,45 @@ static void subghz_saved_list_clear(void) {
     s_saved_index = 0;
 }
 
+static bool subghz_accept_saved_file(const char *name) {
+    const char *ext = strrchr(name, '.');
+    return ext && strcasecmp(ext, SUBGHZ_SNAPSHOT_EXT) == 0;
+}
+
+static void subghz_saved_open_path(const char *path) {
+    if (file_browser_is_dir(path)) {
+        if (file_browser_enter(s_saved_browse_dir, sizeof(s_saved_browse_dir), path)) {
+            subghz_saved_list_clear();
+            subghz_saved_list_reload();
+        }
+        return;
+    }
+    for (int i = 0; i < s_saved_file_count; i++) {
+        if (strcmp(s_saved_file_paths[i], path) == 0) {
+            s_saved_index = i;
+            subghz_open_saved_popup();
+            return;
+        }
+    }
+}
+
 static void subghz_saved_list_item_cb(lv_event_t *e) {
     const char *path = (const char *)lv_event_get_user_data(e);
     if (!path) {
         return;
     }
 
-    for (int i = 0; i < s_saved_file_count; i++) {
-        if (s_saved_file_paths[i] && strcmp(s_saved_file_paths[i], path) == 0) {
-            s_saved_index = i;
-            break;
-        }
-    }
-    subghz_open_saved_popup();
+    subghz_saved_open_path(path);
 }
 
 static void subghz_back_to_root_menu(void) {
+    if (s_in_saved_list && file_browser_parent(s_saved_browse_dir, SUBGHZ_SNAPSHOT_DIR)) {
+        subghz_saved_list_clear();
+        subghz_saved_list_reload();
+        return;
+    }
     s_in_saved_list = false;
+    strcpy(s_saved_browse_dir, SUBGHZ_SNAPSHOT_DIR);
     subghz_saved_list_clear();
     if (!s_ov) {
         return;
@@ -918,41 +936,10 @@ static void subghz_saved_list_reload(void) {
     if (!s_saved_file_paths) {
         bool susp = false;
         bool did = subghz_sd_begin(&susp);
-        DIR *d = opendir(SUBGHZ_SNAPSHOT_DIR);
-        if (d) {
-            struct dirent *de;
-            int count = 0;
-            while ((de = readdir(d)) != NULL) {
-                if (de->d_name[0] == '.') continue;
-                size_t len = strlen(de->d_name);
-                size_t ext_len = strlen(SUBGHZ_SNAPSHOT_EXT);
-                if (len > ext_len && strcmp(de->d_name + len - ext_len, SUBGHZ_SNAPSHOT_EXT) == 0) {
-                    count++;
-                }
-            }
-            rewinddir(d);
-            if (count > 0) {
-                s_saved_file_paths = (char **)calloc((size_t)count, sizeof(char *));
-            }
-            int idx = 0;
-            while ((de = readdir(d)) != NULL) {
-                if (de->d_name[0] == '.') continue;
-                size_t len = strlen(de->d_name);
-                size_t ext_len = strlen(SUBGHZ_SNAPSHOT_EXT);
-                if (!(len > ext_len && strcmp(de->d_name + len - ext_len, SUBGHZ_SNAPSHOT_EXT) == 0)) continue;
-                size_t need = strlen(SUBGHZ_SNAPSHOT_DIR) + 1 + len + 1;
-                char *copy = (char *)malloc(need);
-                if (!copy) continue;
-                snprintf(copy, need, "%s/%s", SUBGHZ_SNAPSHOT_DIR, de->d_name);
-                if (s_saved_file_paths && idx < count) {
-                    s_saved_file_paths[idx++] = copy;
-                } else {
-                    free(copy);
-                }
-            }
-            s_saved_file_count = idx;
-            closedir(d);
-        }
+        size_t count = 0;
+        if (did) file_browser_read(s_saved_browse_dir, subghz_accept_saved_file, 0, (size_t)-1,
+                                  &s_saved_file_paths, &count, NULL);
+        s_saved_file_count = (int)count;
         if (did) {
             subghz_sd_end(susp);
         }
@@ -973,8 +960,7 @@ static void subghz_saved_list_reload(void) {
         options_view_add_item(s_ov, "No .sub files", NULL, NULL);
     } else {
         for (int i = start; i < end; i++) {
-            const char *name = strrchr(s_saved_file_paths[i], '/');
-            name = name ? (name + 1) : s_saved_file_paths[i];
+            const char *name = file_browser_name(s_saved_file_paths[i]);
             options_view_add_item(s_ov, name, subghz_saved_list_item_cb, s_saved_file_paths[i]);
         }
     }
@@ -3036,9 +3022,14 @@ static void subghz_saved_replay_btn_cb(lv_event_t *e) {
 static void subghz_saved_delete_confirm_cb(void *user_data) {
     (void)user_data;
     if (s_saved_file_count <= 0 || !s_saved_file_paths || !s_saved_file_paths[s_saved_index]) return;
-    if (remove(s_saved_file_paths[s_saved_index]) == 0) {
+    bool susp = false;
+    bool did = subghz_sd_begin(&susp);
+    int result = did ? remove(s_saved_file_paths[s_saved_index]) : -1;
+    if (did) subghz_sd_end(susp);
+    if (result == 0) {
         subghz_show_feedback_popup("SubGHz", "Capture deleted");
         subghz_close_saved_popup();
+        subghz_saved_list_clear();
         subghz_saved_list_reload();
     } else {
         subghz_show_feedback_popup("SubGHz error", "Failed to delete capture");
@@ -3227,20 +3218,8 @@ static void subghz_back_btn_cb(lv_event_t *e) {
 }
 
 static void subghz_update_scroll_buttons_visibility(void) {
-#ifdef CONFIG_USE_TOUCHSCREEN
-    lv_obj_t *list = options_view_get_list(s_ov);
-    if (list && lv_obj_is_valid(list)) {
-        lv_coord_t scroll_bottom = lv_obj_get_scroll_bottom(list);
-        lv_coord_t scroll_top = lv_obj_get_scroll_top(list);
-        if (scroll_bottom > 0 || scroll_top > 0) {
-            if (s_scroll_up_btn && lv_obj_is_valid(s_scroll_up_btn)) lv_obj_clear_flag(s_scroll_up_btn, LV_OBJ_FLAG_HIDDEN);
-            if (s_scroll_down_btn && lv_obj_is_valid(s_scroll_down_btn)) lv_obj_clear_flag(s_scroll_down_btn, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            if (s_scroll_up_btn && lv_obj_is_valid(s_scroll_up_btn)) lv_obj_add_flag(s_scroll_up_btn, LV_OBJ_FLAG_HIDDEN);
-            if (s_scroll_down_btn && lv_obj_is_valid(s_scroll_down_btn)) lv_obj_add_flag(s_scroll_down_btn, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
-#endif
+    lv_obj_t *list = (s_ov != NULL) ? options_view_get_list(s_ov) : NULL;
+    gui_touch_bar_update_visibility(&s_touch_tb, list);
 }
 #endif
 
@@ -3261,8 +3240,7 @@ static void subghz_select_row(void) {
         int has_prev = (s_saved_page > 0) ? 1 : 0;
         int has_next = ((s_saved_page + 1) * 7 < s_saved_file_count) ? 1 : 0;
         if (sel < visible_files) {
-            s_saved_index = s_saved_page * 7 + sel;
-            subghz_open_saved_popup();
+            subghz_saved_open_path(s_saved_file_paths[s_saved_page * 7 + sel]);
         } else if (has_prev && sel == visible_files) {
             subghz_saved_list_prev_page_cb(NULL);
         } else if (has_next && sel == visible_files + has_prev) {
@@ -4392,37 +4370,22 @@ static void subghz_input_handler(InputEvent *event) {
         
 #ifdef CONFIG_USE_TOUCHSCREEN
         if (d->state == LV_INDEV_STATE_PR) {
-            if (s_scroll_up_btn && lv_obj_is_valid(s_scroll_up_btn)) {
-                lv_area_t area;
-                lv_obj_get_coords(s_scroll_up_btn, &area);
-                if (d->point.x >= area.x1 && d->point.x <= area.x2 &&
-                    d->point.y >= area.y1 && d->point.y <= area.y2) {
-                    options_view_move_selection(s_ov, -1);
-                    touch_drag_reset(&s_touch_drag);
-                    return;
-                }
+            if (gui_touch_bar_hit(s_scroll_up_btn, d->point.x, d->point.y)) {
+                options_view_move_selection(s_ov, -1);
+                touch_drag_reset(&s_touch_drag);
+                return;
             }
 
-            if (s_scroll_down_btn && lv_obj_is_valid(s_scroll_down_btn)) {
-                lv_area_t area;
-                lv_obj_get_coords(s_scroll_down_btn, &area);
-                if (d->point.x >= area.x1 && d->point.x <= area.x2 &&
-                    d->point.y >= area.y1 && d->point.y <= area.y2) {
-                    options_view_move_selection(s_ov, 1);
-                    touch_drag_reset(&s_touch_drag);
-                    return;
-                }
+            if (gui_touch_bar_hit(s_scroll_down_btn, d->point.x, d->point.y)) {
+                options_view_move_selection(s_ov, 1);
+                touch_drag_reset(&s_touch_drag);
+                return;
             }
 
-            if (s_back_btn && lv_obj_is_valid(s_back_btn)) {
-                lv_area_t area;
-                lv_obj_get_coords(s_back_btn, &area);
-                if (d->point.x >= area.x1 && d->point.x <= area.x2 &&
-                    d->point.y >= area.y1 && d->point.y <= area.y2) {
-                    subghz_back_btn_cb(NULL);
-                    touch_drag_reset(&s_touch_drag);
-                    return;
-                }
+            if (gui_touch_bar_hit(s_back_btn, d->point.x, d->point.y)) {
+                subghz_back_btn_cb(NULL);
+                touch_drag_reset(&s_touch_drag);
+                return;
             }
 
             if (!s_touch_drag.started) {
@@ -4580,6 +4543,46 @@ static void subghz_input_handler(InputEvent *event) {
     }
 }
 
+// Deep-link support for favorites: open a specific saved capture. Safe to
+// call before the view exists - consumed by subghz_view_create(). Heap-backed
+// so it does not burn 256 B of internal RAM on boards without PSRAM.
+static char *s_pending_capture_open = NULL;
+static void subghz_view_apply_pending_open(void);
+
+void subghz_view_open_capture(const char *path) {
+    if (!path || !path[0]) return;
+    free(s_pending_capture_open);
+    s_pending_capture_open = strdup(path);
+    // View already live (e.g. lockscreen overlay on top of it): apply now.
+    if (s_ov && lv_obj_is_valid(s_ov)) {
+        subghz_view_apply_pending_open();
+    }
+}
+
+static void subghz_view_apply_pending_open(void) {
+    if (!s_pending_capture_open) return;
+    char path[256];
+    strncpy(path, s_pending_capture_open, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    free(s_pending_capture_open);
+    s_pending_capture_open = NULL;
+    subghz_saved_list_clear();
+    char *slash = strrchr(path, '/');
+    if (slash && strncmp(path, SUBGHZ_SNAPSHOT_DIR, strlen(SUBGHZ_SNAPSHOT_DIR)) == 0 && path[strlen(SUBGHZ_SNAPSHOT_DIR)] == '/') {
+        size_t len = (size_t)(slash - path);
+        memcpy(s_saved_browse_dir, path, len);
+        s_saved_browse_dir[len] = '\0';
+    }
+    subghz_saved_list_reload();
+    for (int i = 0; i < s_saved_file_count; i++) {
+        if (s_saved_file_paths[i] && strcmp(s_saved_file_paths[i], path) == 0) {
+            s_saved_index = i;
+            subghz_open_saved_popup();
+            return;
+        }
+    }
+}
+
 void subghz_view_create(void) {
     uint8_t theme = settings_get_menu_theme(&G_Settings);
     lv_color_t bg = lv_color_hex(theme_palette_get_background(theme));
@@ -4594,10 +4597,10 @@ void subghz_view_create(void) {
 
 #ifdef CONFIG_USE_TOUCHSCREEN
     const int STATUS_BAR_HEIGHT = GUI_STATUS_BAR_HEIGHT;
-    const int TOUCH_BAR_HEIGHT = SUBGHZ_SCROLL_BTN_SIZE + SUBGHZ_SCROLL_BTN_PADDING * 2;
+    const int TOUCH_BAR_HEIGHT = gui_touch_bar_height();
     int list_h = LV_VER_RES - STATUS_BAR_HEIGHT - TOUCH_BAR_HEIGHT;
-    lv_obj_set_size(list, LV_HOR_RES, list_h);
-    lv_obj_align(list, LV_ALIGN_TOP_LEFT, 0, STATUS_BAR_HEIGHT);
+    lv_obj_set_size(list, GUI_OPTIONS_LIST_WIDTH, list_h);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, STATUS_BAR_HEIGHT);
 #endif
 
     s_scan_row = options_view_add_item(s_ov, "Capture", subghz_scan_row_cb, NULL);
@@ -4606,7 +4609,7 @@ void subghz_view_create(void) {
     s_freq_analyzer_row = options_view_add_item(s_ov, "Freq Analyzer", subghz_freq_analyzer_row_cb, NULL);
     s_waterfall_row = options_view_add_item(s_ov, "Waterfall", subghz_waterfall_row_cb, NULL);
     s_back_row = options_view_add_back_row(s_ov, subghz_back_row_cb, NULL);
-    if (display_manager_previous_view == &main_menu_view) {
+    if (gui_router_previous_view() == &main_menu_view) {
         s_root_selected_index = 0;
     }
     int root_item_count = options_view_get_item_count(s_ov);
@@ -4616,61 +4619,13 @@ void subghz_view_create(void) {
     options_view_set_selected(s_ov, s_root_selected_index);
 
 #ifdef CONFIG_USE_TOUCHSCREEN
-    lv_color_t ctrl_color = lv_color_hex(theme_palette_get_surface_alt(theme));
-    lv_color_t ctrl_text_color = lv_color_hex(theme_palette_get_text(theme));
-
-    lv_obj_t *touch_bar = lv_obj_create(s_root);
-    lv_obj_remove_style_all(touch_bar);
-    lv_obj_set_size(touch_bar, LV_HOR_RES, TOUCH_BAR_HEIGHT);
-    lv_obj_align(touch_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(touch_bar, bg, 0);
-    lv_obj_set_style_bg_opa(touch_bar, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(touch_bar, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-
-    s_scroll_up_btn = lv_btn_create(touch_bar);
-    gui_apply_pressed_style(s_scroll_up_btn);
-    lv_obj_set_size(s_scroll_up_btn, SUBGHZ_SCROLL_BTN_SIZE, SUBGHZ_SCROLL_BTN_SIZE);
-    lv_obj_align(s_scroll_up_btn, LV_ALIGN_LEFT_MID, SUBGHZ_SCROLL_BTN_PADDING, 0);
-    lv_obj_set_style_bg_color(s_scroll_up_btn, ctrl_color, LV_PART_MAIN);
-    lv_obj_set_style_radius(s_scroll_up_btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_scroll_up_btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(s_scroll_up_btn, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(s_scroll_up_btn, subghz_scroll_up_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *up_label = lv_label_create(s_scroll_up_btn);
-    lv_label_set_text(up_label, LV_SYMBOL_UP);
-    lv_obj_set_style_text_color(up_label, ctrl_text_color, 0);
-    lv_obj_center(up_label);
-    lv_obj_add_flag(s_scroll_up_btn, LV_OBJ_FLAG_HIDDEN);
-
-    s_back_btn = lv_btn_create(touch_bar);
-    gui_apply_pressed_style(s_back_btn);
-    lv_obj_set_size(s_back_btn, SUBGHZ_SCROLL_BTN_SIZE + 24, SUBGHZ_SCROLL_BTN_SIZE);
-    lv_obj_align(s_back_btn, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(s_back_btn, ctrl_color, LV_PART_MAIN);
-    lv_obj_set_style_radius(s_back_btn, 5, LV_PART_MAIN);
-    lv_obj_set_style_pad_hor(s_back_btn, 8, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_back_btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(s_back_btn, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(s_back_btn, subghz_back_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *back_label = lv_label_create(s_back_btn);
-    lv_label_set_text(back_label, "Back");
-    lv_obj_set_style_text_color(back_label, ctrl_text_color, 0);
-    lv_obj_center(back_label);
-
-    s_scroll_down_btn = lv_btn_create(touch_bar);
-    gui_apply_pressed_style(s_scroll_down_btn);
-    lv_obj_set_size(s_scroll_down_btn, SUBGHZ_SCROLL_BTN_SIZE, SUBGHZ_SCROLL_BTN_SIZE);
-    lv_obj_align(s_scroll_down_btn, LV_ALIGN_RIGHT_MID, -SUBGHZ_SCROLL_BTN_PADDING, 0);
-    lv_obj_set_style_bg_color(s_scroll_down_btn, ctrl_color, LV_PART_MAIN);
-    lv_obj_set_style_radius(s_scroll_down_btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_border_width(s_scroll_down_btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(s_scroll_down_btn, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(s_scroll_down_btn, subghz_scroll_down_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *down_label = lv_label_create(s_scroll_down_btn);
-    lv_label_set_text(down_label, LV_SYMBOL_DOWN);
-    lv_obj_set_style_text_color(down_label, ctrl_text_color, 0);
-    lv_obj_center(down_label);
-    lv_obj_add_flag(s_scroll_down_btn, LV_OBJ_FLAG_HIDDEN);
+    s_touch_tb = gui_touch_bar_create(s_root);
+    s_scroll_up_btn = s_touch_tb.up_btn;
+    s_back_btn = s_touch_tb.back_btn;
+    s_scroll_down_btn = s_touch_tb.down_btn;
+    if (s_touch_tb.bar != NULL) {
+        gui_touch_bar_set_callbacks(&s_touch_tb, subghz_scroll_up_cb, NULL, subghz_back_btn_cb, NULL, subghz_scroll_down_cb, NULL);
+    }
 #endif
 
     s_remote_mode = subghz_is_remote_mode();
@@ -4684,6 +4639,9 @@ void subghz_view_create(void) {
     memset(s_peaks, 0, sizeof(s_peaks));
 
     s_timer = lv_timer_create(subghz_timer_cb, 33, NULL);
+
+    // Consume any pending favorite deep-link (subghz_view_open_capture).
+    subghz_view_apply_pending_open();
 }
 
 void subghz_view_destroy(void) {
@@ -4697,6 +4655,7 @@ void subghz_view_destroy(void) {
     }
 
     subghz_close_popup(true);
+    subghz_close_capture_popup();
     subghz_close_freq_analyzer_popup();
     subghz_close_waterfall_popup();
     popup_confirm_close(&s_saved_delete_confirm);
@@ -4719,9 +4678,7 @@ void subghz_view_destroy(void) {
     s_back_row = NULL;
 
 #ifdef CONFIG_USE_TOUCHSCREEN
-    lvgl_obj_del_safe(&s_scroll_up_btn);
-    lvgl_obj_del_safe(&s_scroll_down_btn);
-    lvgl_obj_del_safe(&s_back_btn);
+    gui_touch_bar_destroy(&s_touch_tb);
     s_scroll_up_btn = NULL;
     s_scroll_down_btn = NULL;
     s_back_btn = NULL;

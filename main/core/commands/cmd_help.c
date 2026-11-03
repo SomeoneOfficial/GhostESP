@@ -19,7 +19,10 @@ void handle_help(int argc, char **argv) {
 
     // List of all categories to print in order
     const char *all_categories[] = {
-        "wifi", "ble", "chameleon", "comm", "sd", "led", "gps", "shell", "misc", "portal", "printer", "cast", "capture", "beacon", "attack"
+        "wifi", "ble", "chameleon", "comm", "sd", "led", "gps", "shell", "misc", "portal", "printer", "cast", "gadgets", "capture", "beacon", "attack"
+#ifdef CONFIG_HAS_LORA
+        , "lora"
+#endif
 #ifdef CONFIG_HAS_INFRARED
         , "ir"
 #endif
@@ -56,12 +59,15 @@ void handle_help(int argc, char **argv) {
         glog("attack\n");
         glog("    Description: Launch an attack (e.g., deauthentication attack).\n");
         glog("                 Supports multiple selected APs when using 'select -a 1,2,3'.\n");
-        glog("    Usage: attack -d (deauth) | attack -hsd (handshake+deauth) | attack -c (channel switch) | attack -e (EAPOL logoff) | attack -s (SAE flood)\n");
+        glog("    Usage: attack -d (deauth) | attack -hsd (handshake+deauth) | attack -c (channel switch) | attack -e (EAPOL logoff) | attack -p (probe flood) | attack -b (bad msg) | attack -a (auth flood) | attack -s (SAE flood)\n");
         glog("    Arguments:\n");
         glog("        -d  : Start deauth attack (supports multiple APs)\n");
         glog("        -hsd: Start handshake capture + deauth attack (forces handshakes)\n");
         glog("        -c  : Start channel switch attack (supports multiple APs)\n");
         glog("        -e  : Start EAPOL logoff attack\n");
+        glog("        -p  : Start probe request flood attack (supports multiple APs)\n");
+        glog("        -b  : Start bad msg attack (EAPOL key install + zero MIC)\n");
+        glog("        -a  : Start auth flood attack (supports multiple APs)\n");
         glog("        -s  : Start SAE flood attack (ESP32-C5/C6 only)\n\n");
         glog("list\n");
         glog("    Description: List Wi-Fi scan results or connected stations.\n");
@@ -70,11 +76,11 @@ void handle_help(int argc, char **argv) {
         glog("        -a  : Show access points from Wi-Fi scan\n");
         glog("        -s  : List connected stations\n");
         glog("        -airtags: List discovered AirTags\n\n");
-        glog("wpa3check\n");
-        glog("    Description: Run a WPA3 compliance check on the currently selected AP.\n");
+         glog("wpa3check\n");
+         glog("    Description: Run a passive Wi-Fi security check on the currently selected AP.\n");
         glog("                 If no AP is selected, scans all APs and prints a\n");
         glog("                 summary table with WPA3 presence, transition mode,\n");
-        glog("                 PMF posture, and a short security finding per AP.\n");
+         glog("                 PMF, cipher, Enterprise/EAP limitations, and a finding per AP.\n");
         glog("    Usage: wpa3check (after 'scanap' and optionally 'select -a <index>')\n\n");
         glog("beaconspam\n");
         glog("    Description: Start beacon spam with different modes.\n");
@@ -87,6 +93,15 @@ void handle_help(int argc, char **argv) {
         glog("stopspam\n");
         glog("    Description: Stop ongoing beacon spam.\n");
         glog("    Usage: stopspam\n\n");
+        glog("hop\n");
+        glog("    Description: Set the country-aware channel plan for scans and monitors.\n");
+        glog("    Usage: hop [auto | all | basic | custom <channels> | <channels>]\n");
+        glog("    Examples:\n");
+        glog("        hop             : Show current hop mode and channel plan\n");
+        glog("        hop 1,6,11      : Hop only channels 1, 6, and 11\n");
+        glog("        hop all         : Hop every legal channel for this device\n");
+        glog("        hop basic       : Fixed 1,6,11\n");
+        glog("        hop auto        : Default per-feature channel plan (country / AP list)\n\n");
         glog("stopdeauth\n");
         glog("    Description: Stop ongoing deauthentication attack.\n");
         glog("    Usage: stopdeauth\n\n");
@@ -166,19 +181,20 @@ void handle_help(int argc, char **argv) {
         glog("    Description: track selected station signal strength (rssi)\n");
         glog("    Usage: tracksta\n");
         glog("    Note: select a station first with 'select -s <index>'\n\n");
-#if CONFIG_IDF_TARGET_ESP32C5
         glog("setcountry\n");
-        glog("    Description: Set the Wi-Fi country code.\n");
+        glog("    Description: Set the Wi-Fi country code. Channel plans follow the active\n");
+        glog("                 country rules; channel 14 is used only where allowed.\n");
         glog("    Usage: setcountry <CC>\n");
         glog("    Arguments:\n");
         glog("        <CC> : Country code (\"01\" world-safe) or two-letter ISO (e.g., US)\n");
+        glog("    Persisted UI values: US, GB, JP, AU, CN, 01; other ISO codes apply until reboot\n");
         glog("    Supported: 01, AT, AU, BE, BG, BR, CA, CH, CN, CY, CZ, DE, DK, EE, ES, FI, FR, GB, GR, HK, HR, HU,\n");
         glog("               IE, IN, IS, IT, JP, KR, LI, LT, LU, LV, MT, MX, NL, NO, NZ, PL, PT, RO, SE, SI, SK, TW, US\n\n");
-#endif
         return;
     }
 
-#ifndef CONFIG_IDF_TARGET_ESP32S2
+#if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(GHOSTESP_NO_NATIVE_BLE)
+    #include "attacks/ble/ble_spam.h"
     if (strcmp(category, "ble") == 0) {
         glog("\nBLE Commands:\n\n");
         glog("blescan\n");
@@ -194,21 +210,44 @@ void handle_help(int argc, char **argv) {
         glog("        -g   : Start GATT scanner for connectable devices\n");
         glog("        -r   : Scan for raw BLE packets\n");
         glog("        -s   : Stop BLE scanning\n\n");
+        glog("bledetect\n");
+        glog("    Description: Detect trackers, skimmers and beacons by signature\n");
+        glog("    Usage: bledetect [-s|-l|-c|-i|-t <index>|-u|-sp <index>|-h]\n");
+        glog("    Arguments:\n");
+        glog("        (none)      : Begin scanning for detectable BLE devices\n");
+        glog("        -s          : Stop the scan, keeping discovered devices\n");
+        glog("        -l          : List discovered devices with type, name/MAC and RSSI\n");
+        glog("        -c          : Drop stored results (scan must be stopped)\n");
+        glog("        -i          : Show scan state, device count and tracking info\n");
+        glog("        -t <index>  : Follow one device and log its live RSSI\n");
+        glog("        -u          : Stop following the tracked device\n");
+        glog("        -sp <index> : Advertise as a discovered AirTag; 'stopspoof' ends it\n\n");
         glog("blespam\n");
         glog("    Description: Start BLE advertisement spam attacks.\n");
-        glog("    Usage: blespam [OPTION]\n");
+        glog("    Usage: blespam [OPTION] [-name <text>]\n");
         glog("    Arguments:\n");
         glog("        -apple     : Apple device spam (AirPods, Apple TV, etc.)\n");
         glog("        -ms        : Microsoft Swift Pair spam\n");
         glog("        -samsung   : Samsung Galaxy Watch spam\n");
         glog("        -google    : Google Fast Pair spam\n");
         glog("        -random    : Random spam (cycles through all types)\n");
-        glog("        -s         : Stop BLE spam\n\n");
+        glog("        -name <t>  : Advertise a custom name (max %d chars)\n", BLE_SPAM_NAME_MAX);
+        glog("        -s         : Stop BLE spam\n");
+        glog("    Examples:\n");
+        glog("        blespam -apple -name \"My AirPods\"\n");
+        glog("        blespam -ms -name \"GhostESP\"\n");
+        glog("        blespam -name \"T-Deck\"    (renames a running spam)\n\n");
         glog("blewardriving\n");
         glog("    Description: Start/Stop BLE wardriving with GPS logging\n");
         glog("    Usage: blewardriving [-s]\n");
         glog("    Arguments:\n");
         glog("        -s  : Stop BLE wardriving\n\n");
+        glog("dualwd\n");
+        glog("    Description: Start/Stop BLE + WiFi coexistence wardriving (PSRAM only)\n");
+        glog("    Usage: dualwd [start|-s]\n");
+        glog("    Arguments:\n");
+        glog("        start : Start dual wardriving (default)\n");
+        glog("        -s    : Stop dual wardriving\n\n");
         glog("list -airtags\n");
         glog("    Description: List discovered AirTags\n");
         glog("    Usage: list -airtags\n\n");
@@ -260,7 +299,8 @@ void handle_help(int argc, char **argv) {
         glog("commstatus\n    Show communication status.\n    Usage: commstatus\n\n");
         glog("commdisconnect\n    Disconnect from current peer.\n    Usage: commdisconnect\n\n");
         glog("commsetpins\n    Change communication GPIO pins at runtime.\n    Usage: commsetpins <tx_pin> <rx_pin>\n    Example: commsetpins 4 5\n\n");
-#ifndef CONFIG_IDF_TARGET_ESP32S2
+        glog("glbench\n    Measure GhostLink throughput in both directions.\n    Usage: glbench [send|recv|both] [kb]\n           glbench stop | glbench status\n    Example: glbench send 512\n\n");
+#if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(GHOSTESP_NO_NATIVE_BLE)
         glog("blebridge\n    Start/status/stop the BLE GhostLink bridge.\n    Usage: blebridge [start|stop|status|pair <peer_name>]\n\n");
 #endif
         return;
@@ -286,6 +326,18 @@ void handle_help(int argc, char **argv) {
         glog("sd_save_config\n    Save pin config to NVS.\n    Usage: sd_save_config\n\n");
         return;
     }
+
+#ifdef CONFIG_HAS_USB_MSC_SD
+    if (strcmp(category, "usbsd") == 0) {
+        glog("\nUSB SD Passthrough Commands:\n\n");
+        glog("usbsd\n    Toggle USB SD passthrough (card becomes a USB drive on the host PC).\n    Usage: usbsd\n\n");
+        glog("usbsd on\n    Start passthrough: SD is handed to the USB host, serial console detaches.\n    Usage: usbsd on\n\n");
+        glog("usbsd off\n    Stop passthrough and remount the SD card.\n    Usage: usbsd off\n\n");
+        glog("usbsd status\n    Show passthrough state.\n    Usage: usbsd status\n\n");
+        glog("Note: use WiFi/WebUI to exit if the serial console is detached.\n\n");
+        return;
+    }
+#endif
 
     if (strcmp(category, "led") == 0) {
         glog("\nLED & RGB Commands:\n\n");
@@ -315,6 +367,13 @@ void handle_help(int argc, char **argv) {
         glog("        - CPU cores and features\n");
         glog("        - Flash size and memory info\n");
         glog("        - ESP-IDF version\n\n");
+        glog("devices\n");
+        glog("    Description: List enabled hardware devices with their active pins and state\n");
+        glog("    Usage: devices\n\n");
+        glog("irpin\n");
+        glog("    Description: Show or override the IR TX/RX pins (persisted in settings)\n");
+        glog("    Usage: irpin | irpin tx|rx <pin|-1>\n");
+        glog("    TX changes apply after reboot; RX changes apply at the next IR learn\n\n");
         glog("crash\n");
         glog("    Description: Intentionally trigger a crash (for coredump testing).\n");
         glog("    Usage: crash\n");
@@ -330,9 +389,18 @@ void handle_help(int argc, char **argv) {
         glog("timezone\n");
         glog("    Description: Set the display timezone for the clock view.\n");
         glog("    Usage: timezone <TZ_STRING>\n\n");
+        glog("clockstyle\n");
+        glog("    Description: Switch the Clock view between digital, analog and segment faces.\n");
+        glog("    Usage: clockstyle [digital|analog|segment|toggle|status]\n\n");
+        glog("statusbarclock\n");
+        glog("    Description: Show or hide the clock in the status bar centre.\n");
+        glog("    Usage: statusbarclock [on|off|toggle|status]\n\n");
         glog("webauth\n");
         glog("    Description: Enable/disable web authentication.\n");
-        glog("    Usage: webauth <enable|disable>\n\n");
+        glog("    Usage: webauth [on|off|toggle|status]\n\n");
+        glog("privacy\n");
+        glog("    Description: Redact Wi-Fi/BLE SSIDs and MAC addresses on screen.\n");
+        glog("    Usage: privacy [on|off|toggle|status]\n\n");
         glog("pineap\n");
         glog("    Description: Start/Stop detecting WiFi Pineapples.\n");
         glog("    Usage: pineap [-s]\n");
@@ -377,7 +445,13 @@ void handle_help(int argc, char **argv) {
         glog("    Description: Probe SNMP v1/v2c services with common communities\n");
         glog("    Usage: snmpprobe\n");
         glog("           snmpprobe <IP>\n");
-        glog("           snmpprobe subnet <a.b.c[.0|.]>\n\n");
+        glog("           snmpprobe subnet <a.b.c[.0|.]>\n");
+        glog("           snmpprobe walk <IP> [OID]\n");
+        glog("           snmpprobe communities <c1,c2,...|file>\n\n");
+        glog("mdnssniff\n");
+        glog("    Description: Passively sniff local names (mDNS/LLMNR/SSDP/NetBIOS) per host\n");
+        glog("    Usage: mdnssniff <IP|all>\n");
+        glog("           mdnssniff stop\n\n");
         glog("settings\n");
         glog("    Description: Manage NVS stored settings via command line\n");
         glog("    Usage: settings <command> [arguments]\n");
@@ -392,16 +466,59 @@ void handle_help(int argc, char **argv) {
         glog("        settings get ap_ssid\n");
         glog("        settings set rgb_mode 1\n");
         glog("        settings reset\n\n");
+        glog("loglevel\n");
+        glog("    Description: View or change the global ESP-IDF log level.\n");
+        glog("    Usage: loglevel [none|error|warn|info|debug|verbose]\n\n");
         glog("    Description: View or change the status display idle animation (status OLED only).\n");
         glog("    Usage: statusidle [list|set <life|ghost|starfield|hud|matrix|ghosts|spiral|leaves|bouncing|0|1|2|3|4|5|6|7|8>]\n\n");
         return;
     }
+#ifdef CONFIG_HAS_LORA
+    if (strcmp(category, "lora") == 0 || strcmp(category, "mesh") == 0) {
+        glog("\nLoRa / Mesh Commands:\n\n");
+        glog("-- Choosing a protocol (one radio, one protocol at a time) --\n");
+        glog("mesh\n    Show the active mesh and how to switch.\n    Usage: mesh | mesh status\n\n");
+        glog("mesh switch\n    Stop the current protocol and start another.\n    Usage: mesh switch <meshtastic|meshcore>\n\n");
+        glog("mesh on / off\n    Start the remembered protocol / stop the active one.\n    Usage: mesh on [meshtastic|meshcore] | mesh off\n\n");
+        glog("mesh autostart\n    Choose what starts on boot.\n    Usage: mesh autostart <meshtastic|meshcore|off>\n\n");
+        glog("-- Basics --\n");
+        glog("lora\n    Show LoRa status.\n    Usage: lora [status]\n\n");
+        glog("lora on / off\n    Start or stop the Meshtastic radio.\n    Usage: lora on | lora off\n\n");
+        glog("lora region\n    Set the region while the radio is stopped.\n    Usage: lora region <name>   (e.g. anz)\n\n");
+        glog("lora setup\n    Show first-time setup guidance.\n    Usage: lora setup\n\n");
+        glog("lora autostart\n    Choose what starts on boot.\n    Usage: lora autostart <meshtastic|meshcore|on|off>\n\n");
+        glog("lora set\n    Change a radio or node setting.\n    Usage: lora set <preset|sf|bw|cr|tx|hop|offset|ovrfreq|chnum|txen|role|owner|companion|autostart> <value>\n\n");
+        glog("-- Messaging --\n");
+        glog("lora send / messages\n    Send on channel 0 / read received messages.\n    Usage: lora send <text> | lora messages\n\n");
+        glog("lora dm\n    PKI-encrypted direct message.\n    Usage: lora dm <node> <text>\n\n");
+        glog("lora nodes\n    List nearby nodes.\n    Usage: lora nodes\n\n");
+        glog("lora channels\n    Show the 8 channel slots.\n    Usage: lora channels\n\n");
+        glog("lora nodeinfo\n    Exchange NodeInfo now (broadcast by default).\n    Usage: lora nodeinfo [node]\n\n");
+        glog("-- Phone app (Meshtastic app over BLE) --\n");
+        glog("lora ble\n    Start/stop the app BLE link or show its state.\n    Usage: lora ble [on|off|status]   (alias: mesh app)\n\n");
+        glog("lora ble pin\n    Set the app pairing PIN. Default is none (no prompt).\n"
+             "    The PIN is shown on the node screen and in this terminal when the phone connects.\n"
+             "    Usage: lora ble pin <none|random|fixed [6-digit pin]>   (alias: mesh pin)\n"
+             "    Modes:\n"
+             "        none   : no PIN, no pairing prompt\n"
+             "        random : new 6-digit PIN each pairing\n"
+             "        fixed  : fixed PIN (default 123456)\n"
+             "    Changing mode drops the link; forget the node on the phone, then reconnect.\n\n");
+        glog("lora app\n    Show app link counters.\n    Usage: lora app\n\n");
+        glog("-- Keys (PKI) --\n");
+        glog("lora pubkey | pkinfo <node> | pki-regen\n    Show our public key / peer + our keys / regenerate the keypair.\n\n");
+        glog("-- Diagnostics --\n");
+        glog("lora diag | cad | reg <addr> [count]\n    Radio diagnostics, channel-activity detect, register read.\n");
+        glog("lora pkitest <node> | pkselftest | pktry <hex>\n    PKI loopback and known-answer tests.\n\n");
+        return;
+    }
+#endif
     if (strcmp(category, "gps") == 0) {
         glog("\nGPS Commands:\n\n");
         glog("gpsinfo\n    Show GPS info.\n    Usage: gpsinfo [-s]\n\n");
         glog("gpspin\n    Set GPS RX pin for external GPS module.\n    Usage: gpspin <pin>\n\n");
         glog("gpsbaud\n    Set GPS baud rate or auto-detect it.\n    Usage: gpsbaud <auto|0|4800|9600|19200|38400|57600|115200>\n\n");
-        glog("startwd\n    Start GPS wardriving.\n    Usage: startwd [-s] [--helper] [--channels <csv>] [--hop <ms>] [--weighted]\n\n");
+        glog("startwd\n    Start GPS wardriving.\n    Usage: startwd [-s] [--active|--monitor] [--helper] [--channels <csv>] [--hop <ms>] [--weighted]\n    C5/S3 default to driver active scans; --monitor selects beacon/probe capture.\n\n");
         return;
     }
     if (strcmp(category, "shell") == 0) {
@@ -490,6 +607,12 @@ void handle_help(int argc, char **argv) {
         return;
     }
 
+    if (strcmp(category, "gadgets") == 0) {
+        glog("wol <MAC|IP> [broadcast IP]\n");
+        glog("govee scan | govee <IP> on|off|brightness N|color RRGGBB\n");
+        return;
+    }
+
     if (strcmp(category, "capture") == 0) {
         glog("\nCapture Commands:\n\n");
         glog("capture\n");
@@ -508,9 +631,9 @@ void handle_help(int argc, char **argv) {
         glog("                    Usage: capture -export <pcap-file>\n");
         glog("        -wireshark : Stream raw PCAP to USB/UART for Wireshark\n");
         glog("                    Usage: capture -wireshark [-c <channel>|-channel <channel>]\n");
-        glog("                    -channel <n>: Lock to specific channel (1-%d)\n", MAX_WIFI_CHANNEL);
+        glog("                    -channel <n>: Lock to a target/country-valid channel\n");
         glog("        -wiresharkble : Stream BLE PCAP to USB/UART for Wireshark\n");
-        #ifndef CONFIG_IDF_TARGET_ESP32S2
+#if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(GHOSTESP_NO_NATIVE_BLE)
         glog("        -ble       : Start BLE packet capture\n");
         glog("        -skimmer   : Start skimmer (BLE) detection\n");
         #endif
@@ -773,6 +896,9 @@ void handle_help(int argc, char **argv) {
     glog("  help ble       - Bluetooth/BLE commands\n");
     glog("  help comm      - ESP32 communication commands\n");
     glog("  help sd        - SD card commands\n");
+#ifdef CONFIG_HAS_USB_MSC_SD
+    glog("  help usbsd     - USB SD passthrough commands\n");
+#endif
     glog("  help led       - LED/RGB commands\n");
     glog("  help gps       - GPS commands\n");
     glog("  help shell     - Headless shell commands\n");
@@ -784,6 +910,9 @@ void handle_help(int argc, char **argv) {
     glog("  help capture   - Wi-Fi packet capture commands\n");
     glog("  help beacon    - Beacon spam commands\n");
     glog("  help attack    - Attack/flood commands\n");
+#ifdef CONFIG_HAS_LORA
+    glog("  help lora      - LoRa / Meshtastic / mesh commands\n");
+#endif
 #ifdef CONFIG_HAS_INFRARED
     glog("  help ir        - Infrared commands\n");
 #endif

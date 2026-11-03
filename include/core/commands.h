@@ -24,6 +24,9 @@ void handle_wifi_connection(int argc, char **argv);
 void handle_wifi_disconnect(int argc, char **argv);
 void handle_wifi_status(int argc, char **argv);
 void handle_wifi_autoreconnect_cmd(int argc, char **argv);
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+void handle_p4_slave_ota_cmd(int argc, char **argv);
+#endif
 void handle_ip_lookup(int argc, char **argv);
 void handle_track_ap_cmd(int argc, char **argv);
 void handle_track_sta_cmd(int argc, char **argv);
@@ -31,6 +34,7 @@ void handle_track_sta_cmd(int argc, char **argv);
 // WiFi attacks
 void handle_attack_cmd(int argc, char **argv);
 void handle_beaconspam(int argc, char **argv);
+void handle_hop_cmd(int argc, char **argv);
 void handle_beaconadd(int argc, char **argv);
 void handle_beaconremove(int argc, char **argv);
 void handle_beaconclear(int argc, char **argv);
@@ -50,20 +54,33 @@ void handle_timezone_cmd(int argc, char **argv);
 void handle_loadconfig_cmd(int argc, char **argv);
 void handle_web_auth_cmd(int argc, char **argv);
 void handle_webuiap_cmd(int argc, char **argv);
+void handle_privacy_cmd(int argc, char **argv);
+void handle_clockstyle_cmd(int argc, char **argv);
+void handle_statusbarclock_cmd(int argc, char **argv);
 
 // BadUSB and USB keyboard host
 void handle_badusb_cmd(int argc, char **argv);
 void handle_usb_kbd_cmd(int argc, char **argv);
+#ifdef CONFIG_HAS_USB_MSC_SD
+void handle_usbsd_cmd(int argc, char **argv);
+#endif
+#ifdef CONFIG_HAS_BADBLE
+void handle_badble_cmd(int argc, char **argv);
+#endif
 
 #if CONFIG_ENABLE_GHOSTSCRIPT
 // GhostScript
 void handle_script_cmd(int argc, char **argv);
 #endif
 
-#ifndef CONFIG_IDF_TARGET_ESP32S2
+#if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(GHOSTESP_NO_NATIVE_BLE)
 // BLE, AirTag, Flipper, GATT, Chameleon, and BLE spam
 void handle_ble_scan_cmd(int argc, char **argv);
+void handle_ble_detect_cmd(int argc, char **argv);
 void handle_ble_wardriving(int argc, char **argv);
+#if !defined(CONFIG_IDF_TARGET_ESP32P4)
+void handle_dualwd(int argc, char **argv);
+#endif
 void handle_list_airtags_cmd(int argc, char **argv);
 void handle_select_airtag(int argc, char **argv);
 void handle_spoof_airtag(int argc, char **argv);
@@ -91,6 +108,7 @@ void handle_snmp_probe(int argc, char **argv);
 void handle_enum_scan(int argc, char **argv);
 void handle_congestion_cmd(int argc, char **argv);
 void handle_listen_probes_cmd(int argc, char **argv);
+void handle_mdns_sniff(int argc, char **argv);
 void handle_dhcpstarve_cmd(int argc, char **argv);
 
 // Scan cancellation helpers (used by stop-all handler)
@@ -145,6 +163,8 @@ void handle_nfc_cmd(int argc, char **argv);
 void handle_nfctest_cmd(int argc, char **argv);
 bool nfc_cli_stop(void);
 void handle_tp_link_test(int argc, char **argv);
+void handle_wol_cmd(int argc, char **argv);
+void handle_govee_cmd(int argc, char **argv);
 void handle_status_idle_cmd(int argc, char **argv);
 void handle_unknown_command(const char *cmd);
 
@@ -157,11 +177,13 @@ void handle_wpa3_compliance(int argc, char **argv);
 void handle_pineap_detection(int argc, char **argv);
 void handle_ap_enable_cmd(int argc, char **argv);
 void handle_chip_info_cmd(int argc, char **argv);
+void handle_devices_cmd(int argc, char **argv);
+void handle_ir_pin_cmd(int argc, char **argv);
 void handle_mirror_cmd(int argc, char **argv);
 void handle_apps_cmd(int argc, char **argv);
-#if CONFIG_IDF_TARGET_ESP32C5
+void handle_log_level_cmd(int argc, char **argv);
+void handle_fav_cmd(int argc, char **argv);
 void handle_setcountry(int argc, char **argv);
-#endif
 
 // Capture commands
 void handle_capture_scan(int argc, char **argv);
@@ -232,6 +254,7 @@ void handle_comm_send(int argc, char **argv);
 void handle_comm_status(int argc, char **argv);
 void handle_comm_disconnect(int argc, char **argv);
 void handle_comm_setpins(int argc, char **argv);
+void handle_glbench_cmd(int argc, char **argv);
 void cmd_comm_register_callback(void);
 
 // GhostLink peer-flashing commands (see managers/peer_ota_manager.c)
@@ -273,6 +296,15 @@ void handle_subghz_cmd(int argc, char **argv);
 
 // NRF24 analyzer
 void handle_nrf24_cmd(int argc, char **argv);
+
+// LoRa (SX1262/SX1276/LLCC68, Meshtastic-lite target)
+void handle_lora_cmd(int argc, char **argv);
+
+// MeshCore (SX1262-family, MeshCore-compatible companion node)
+void handle_meshcore_cmd(int argc, char **argv);
+
+// Unified mesh layer: switch between Meshtastic/MeshCore and shared verbs
+void handle_mesh_cmd(int argc, char **argv);
 
 // Printer command
 void handle_printer_command(int argc, char **argv);

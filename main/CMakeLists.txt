@@ -173,6 +173,11 @@ if(CONFIG_HAS_BADUSB)
     list(APPEND required_components esp_tinyusb)
 endif()
 
+# USB SD passthrough also needs the TinyUSB device stack.
+if(CONFIG_HAS_USB_MSC_SD)
+    list(APPEND required_components esp_tinyusb)
+endif()
+
 # Add motion detector manager when camera is enabled (S3 only)
 if(CONFIG_HAS_CAMERA)
     list(APPEND sources "${CMAKE_SOURCE_DIR}/main/managers/motion_detector_manager.c")

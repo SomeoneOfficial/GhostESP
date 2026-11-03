@@ -31,7 +31,9 @@
 #include "managers/settings_manager.h"
 #include "managers/status_display_manager.h"
 #include "managers/ghostchi_manager.h"
+#if !defined(CONFIG_IDF_TARGET_ESP32P4)
 #include "esp_bt.h"
+#endif
 #include "managers/ap_manager.h"
 #include "managers/wifi_manager.h"
 #include "core/scan_saver.h"
@@ -39,6 +41,10 @@
 #include "scans/ble/airtag_scan.h"
 #include "scans/ble/gatt_scan.h"
 #include "attacks/ble/ble_spam.h"
+#include "managers/ble_bridge_manager.h"
+#ifdef CONFIG_HAS_BADBLE
+#include "managers/badble_manager.h"
+#endif
 
 #define MAX_DEVICES 30
 #define MAX_HANDLERS 10
@@ -70,6 +76,8 @@ static volatile bool ble_pending_clear = false;
 static volatile bool ble_cb_busy = false;
 static uint32_t ble_pcap_packet_count = 0;
 static uint32_t ble_pcap_event_total_count = 0;
+
+static volatile bool ble_suspend_allowed = true;
 
 #ifndef CONFIG_IDF_TARGET_ESP32S2
 static bool ble_ap_suspended = false;
@@ -217,8 +225,16 @@ void nimble_host_task(void *param) {
 static BaseType_t ble_create_host_task(void) {
 #if defined(CONFIG_SPIRAM)
     if (!nimble_host_task_stack) {
+#if defined(CONFIG_BT_NIMBLE_NVS_PERSIST)
+        /* Bond restore/write performs flash operations from this task. Keep
+         * its active stack internal because flash cache operations can make
+         * PSRAM inaccessible, especially on ESP32-C5/C61. */
+        nimble_host_task_stack = heap_caps_malloc(NIMBLE_HOST_TASK_STACK_SIZE * sizeof(StackType_t),
+                                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
         nimble_host_task_stack = heap_caps_malloc(NIMBLE_HOST_TASK_STACK_SIZE * sizeof(StackType_t),
                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
     }
     if (!nimble_host_task_buffer) {
         nimble_host_task_buffer = heap_caps_malloc(sizeof(StaticTask_t),
@@ -230,7 +246,11 @@ static BaseType_t ble_create_host_task(void) {
                                                    nimble_host_task_stack,
                                                    nimble_host_task_buffer);
         if (nimble_host_task_handle) {
+#if defined(CONFIG_BT_NIMBLE_NVS_PERSIST)
+            ESP_LOGI(TAG_BLE, "nimble_host stack allocated from internal RAM: %d bytes",
+#else
             ESP_LOGI(TAG_BLE, "nimble_host stack allocated from PSRAM: %d bytes",
+#endif
                      (int)(NIMBLE_HOST_TASK_STACK_SIZE * sizeof(StackType_t)));
             return pdPASS;
         }
@@ -270,9 +290,15 @@ static void ble_on_reset(int reason) {
 }
 
 static void ble_suspend_networking(void) {
+    if (!ble_suspend_allowed) {
+        ESP_LOGI(TAG_BLE, "Wi-Fi suspension suppressed (coexistence session active)");
+        return;
+    }
     if (ble_ap_suspended || ble_wifi_suspended) {
         return;
     }
+
+    wifi_manager_set_reconnect_hold(true);
 
     bool server_running = false;
     ap_manager_get_status(&server_running, NULL, NULL);
@@ -284,14 +310,20 @@ static void ble_suspend_networking(void) {
     if (server_running) {
         ESP_LOGI(TAG_BLE, "Suspending GhostNet AP before BLE init");
         TERMINAL_VIEW_ADD_TEXT("Suspending AP for BLE\n");
+#ifdef CONFIG_SPIRAM
+        ap_manager_stop_services();
+#else
         ap_manager_deinit();
+#endif
         ble_ap_suspended = true;
         ble_wifi_suspended = false;
         ble_prev_wifi_mode = WIFI_MODE_AP;
     } else if (cur_mode != WIFI_MODE_NULL) {
         ESP_LOGI(TAG_BLE, "Stopping Wi-Fi (mode=%d) before BLE init", cur_mode);
         esp_wifi_stop();
+#ifndef CONFIG_SPIRAM
         esp_wifi_deinit();
+#endif
         ble_wifi_suspended = true;
         ble_prev_wifi_mode = cur_mode;
         ble_ap_suspended = false;
@@ -311,16 +343,23 @@ static void ble_resume_networking(void) {
         ble_stack_ready = false;
 
         if (ble_initialized) {
+            wifi_manager_set_reconnect_hold(false);
             return;
         }
 
+#ifdef CONFIG_SPIRAM
+        esp_err_t err = ap_manager_start_services();
+#else
         esp_err_t err = ap_manager_init();
         if (err == ESP_OK) {
             wifi_manager_configure_sta_from_settings();
-            (void)ap_manager_start_services();
-        } else {
+            (void)ap_manager_restore_after_attack("ble resume");
+        }
+#endif
+        if (err != ESP_OK) {
             ESP_LOGE(TAG_BLE, "Failed to reinit AP manager: 0x%X", (unsigned int)err);
         }
+        wifi_manager_set_reconnect_hold(false);
     } else if (ble_wifi_suspended) {
         ESP_LOGI(TAG_BLE, "Restoring Wi-Fi (mode=%d) after BLE deinit", ble_prev_wifi_mode);
         ble_wifi_suspended = false;
@@ -331,14 +370,21 @@ static void ble_resume_networking(void) {
         size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         ESP_LOGI(TAG_BLE, "Pre Wi-Fi init heap: free=%u, largest=%u", (unsigned)free_heap, (unsigned)largest_block);
 
+        esp_err_t err = ESP_OK;
+#ifndef CONFIG_SPIRAM
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         if (largest_block < 40000) {
             cfg.static_rx_buf_num = 4;
             cfg.dynamic_rx_buf_num = 8;
             ESP_LOGW(TAG_BLE, "Heap fragmented, using reduced Wi-Fi buffers");
         }
-
-        esp_err_t err = esp_wifi_init(&cfg);
+        err = esp_wifi_init(&cfg);
+        if (err == ESP_OK) {
+            // Custom cfg path bypasses ap_manager_ensure_wifi_init(); still
+            // force RAM-only config storage so radio state never persists.
+            esp_wifi_set_storage(WIFI_STORAGE_RAM);
+        }
+#endif
         if (err == ESP_OK) {
             wifi_mode_t mode = (ble_prev_wifi_mode == WIFI_MODE_NULL) ? WIFI_MODE_STA : ble_prev_wifi_mode;
             if (mode == WIFI_MODE_APSTA) {
@@ -360,6 +406,9 @@ static void ble_resume_networking(void) {
                      esp_err_to_name(err), (unsigned)free_heap, (unsigned)largest_block);
         }
         ble_prev_wifi_mode = WIFI_MODE_NULL;
+        wifi_manager_set_reconnect_hold(false);
+    } else {
+        wifi_manager_set_reconnect_hold(false);
     }
 }
 
@@ -370,6 +419,12 @@ static void restart_ble_stack(void) {
     }
 
     ble_stack_ready = false;
+
+#ifdef CONFIG_HAS_BADBLE
+    /* The HID profile owns the global GATT database; a raw NimBLE restart
+     * cannot keep it. Stop it so the restart does not leave dangling state. */
+    badble_manager_stop_profile();
+#endif
 
     // Stop any active advertising
     if (ble_gap_adv_active()) {
@@ -450,6 +505,10 @@ static void restart_ble_stack(void) {
 
 void stop_ble_stack() {
     int rc;
+
+#ifdef CONFIG_HAS_BADBLE
+    badble_manager_stop_profile();
+#endif
 
     rc = ble_gap_adv_stop();
     if (rc != 0) {
@@ -719,6 +778,9 @@ bool ble_stop_custom_adv(void) {
 }
 
 static bool wait_for_ble_ready(void) {
+    if (!ble_initialized) {
+        return false;
+    }
     int rc;
     int retry_count = 0;
     const int max_retries = 50; // 5 seconds total timeout
@@ -748,8 +810,21 @@ static bool wait_for_ble_ready(void) {
 }
 
 bool ble_start_scanning(void) {
+#ifdef CONFIG_HAS_BADBLE
+    if (badble_manager_is_running()) {
+        ESP_LOGW(TAG_BLE, "Cannot start a scan while BadBLE is active");
+        TERMINAL_VIEW_ADD_TEXT("Stop BadBLE before starting a BLE scan\n");
+        return false;
+    }
+#endif
     if (!ble_initialized) {
         ble_init();
+        if (!ble_initialized) {
+            ESP_LOGE(TAG_BLE, "BLE init failed, scan aborted");
+            TERMINAL_VIEW_ADD_TEXT("BLE init failed\n");
+            status_display_show_status("BLE Init Fail");
+            return false;
+        }
     }
 
     if (!wait_for_ble_ready()) {
@@ -827,8 +902,10 @@ esp_err_t ble_unregister_handler(ble_data_handler_t handler) {
     return ESP_ERR_NOT_FOUND;
 }
 
-void ble_init(void) {
 #ifndef CONFIG_IDF_TARGET_ESP32S2
+bool ble_init_with_pre_host(ble_pre_host_init_fn init_fn,
+                            ble_pre_host_cleanup_fn cleanup_fn,
+                            void *arg) {
     // --- pre-init ram check ---
     size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -854,7 +931,11 @@ void ble_init(void) {
         TERMINAL_VIEW_ADD_TEXT("WARNING: <45KB RAM free (%d bytes). BLE may not initialize!\n", (int)free_heap);
     }
 
-    if (!ble_initialized) {
+    if (ble_initialized) {
+        return init_fn == NULL;
+    }
+
+    {
         ble_stack_ready = false;
         esp_err_t ret = nvs_flash_init();
         if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -869,9 +950,12 @@ void ble_init(void) {
         memset(handlers, 0, sizeof(handlers));
         handler_count = 0;
 
-        // Release Classic BT controller memory on non-ESP32 targets too to free RAM for NimBLE
-        // Safe to call multiple times; ignore return if already released
+        // Release Classic BT controller memory on native-controller targets.
+        // ESP32-P4 has no local controller; its hosted BT controller lives on
+        // the C6 and is initialized by app_main through ESP-Hosted.
+#if !defined(CONFIG_IDF_TARGET_ESP32P4)
         (void)esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+#endif
 
         // log DMA-capable internal heap info right before NimBLE init
         size_t free_internal_dma = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
@@ -888,7 +972,16 @@ void ble_init(void) {
             size_t largest_dma_after = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
             ESP_LOGI(TAG_BLE, "post-fail dma-ram: free=%d bytes (largest block=%d)", (int)free_dma_after, (int)largest_dma_after);
             ble_resume_networking();
-            return;
+            return false;
+        }
+
+        if (init_fn && init_fn(arg) != ESP_OK) {
+            if (cleanup_fn) {
+                cleanup_fn(arg);
+            }
+            nimble_port_deinit();
+            ble_resume_networking();
+            return false;
         }
 
         // Create exit semaphore for safe task synchronization
@@ -903,8 +996,12 @@ void ble_init(void) {
         // Configure and start the NimBLE host task (larger stack to avoid overflow on S3)
         if (ble_create_host_task() != pdPASS) {
             ESP_LOGE(TAG_BLE, "Failed to create nimble_host task");
+            if (cleanup_fn) {
+                cleanup_fn(arg);
+            }
+            nimble_port_deinit();
             ble_resume_networking();
-            return;
+            return false;
         }
         
         // Wait for NimBLE stack to be ready
@@ -916,11 +1013,24 @@ void ble_init(void) {
         ESP_LOGI(TAG_BLE, "BLE initialized");
         TERMINAL_VIEW_ADD_TEXT("BLE initialized\n");
     }
+    return true;
+}
+#endif
+
+void ble_init(void) {
+#ifndef CONFIG_IDF_TARGET_ESP32S2
+    (void)ble_init_with_pre_host(NULL, NULL, NULL);
 #endif
 }
 
 void ble_deinit(void) {
     if (ble_initialized) {
+#ifdef CONFIG_HAS_BADBLE
+        badble_manager_stop_profile();
+#endif
+        if (ble_bridge_is_running()) {
+            ble_bridge_stop();
+        }
         ble_spam_stop();
         ble_stop_spoofing();
         if (flipper_scan_is_active()) {
@@ -945,6 +1055,10 @@ void ble_deinit(void) {
             if (!ble_wait_for_scan_stop(1200)) {
                 ESP_LOGW(TAG_BLE, "ble_deinit: scan did not stop before timeout");
             }
+        }
+
+        if (ble_gap_adv_active()) {
+            (void)ble_gap_adv_stop();
         }
 
         if (!ble_wait_for_callbacks_idle(1200)) {
@@ -983,11 +1097,16 @@ void ble_deinit(void) {
         ble_initialized = false;
         ble_pending_clear = false;
         ble_cb_busy = false;
+        ble_suspend_allowed = true;
         ESP_LOGI(TAG_BLE, "BLE deinitialized successfully.");
         TERMINAL_VIEW_ADD_TEXT("BLE deinitialized successfully.\n");
 
         ble_resume_networking();
     }
+}
+
+void ble_set_suspend_allowed(bool allow) {
+    ble_suspend_allowed = allow;
 }
 
 bool ble_is_initialized(void) {

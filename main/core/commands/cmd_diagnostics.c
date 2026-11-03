@@ -17,7 +17,11 @@
 #include "attacks/ethernet/eth_arp_poison.h"
 #include "attacks/wifi/dhcp_starvation.h"
 #include "core/dns_server.h"
+#include "scans/wifi/name_sniff.h"
 #include "managers/aerial_detector_manager.h"
+#ifdef CONFIG_HAS_BADBLE
+#include "managers/badble_manager.h"
+#endif
 #include "managers/ble_manager.h"
 #include "managers/dial_manager.h"
 #include "managers/display_manager.h"
@@ -31,6 +35,7 @@
 #include "managers/views/terminal_screen.h"
 #include "managers/wifi_manager.h"
 #include "managers/zigbee_manager.h"
+#include "scans/ble/device_detect_scan.h"
 #include "scans/wifi/arp_scan.h"
 #include "sdkconfig.h"
 #include "vendor/GPS/gps_logger.h"
@@ -78,7 +83,7 @@ void discover_task(void *pvParameter) {
         UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
         glog("discover_task min stack free: %u words\n", (unsigned)hwm);
     }
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 
@@ -141,16 +146,45 @@ void handle_stop_flipper(int argc, char **argv) {
         stopped_any = true;
     }
     wifi_manager_stop_channel_switch_attack();
+    if (wifi_manager_is_probe_flood_running()) {
+        glog("Stopped probe request flood.\n");
+        stopped_any = true;
+    }
+    wifi_manager_stop_probe_flood();
+    if (wifi_manager_is_bad_msg_running()) {
+        glog("Stopped bad msg attack.\n");
+        stopped_any = true;
+    }
+    wifi_manager_stop_bad_msg();
+    if (wifi_manager_is_auth_flood_running()) {
+        glog("Stopped auth flood attack.\n");
+        stopped_any = true;
+    }
+    wifi_manager_stop_auth_flood();
     wifi_manager_cancel_connect();
 
-#ifndef CONFIG_IDF_TARGET_ESP32S2
+#if !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(GHOSTESP_NO_NATIVE_BLE)
     if (ble_spam_is_running()) {
         glog("Stopped BLE spam.\n");
         stopped_any = true;
     }
     ble_spam_stop();
     ble_stop_gatt_scan();
+#ifdef CONFIG_HAS_BADBLE
+    if (badble_manager_is_running()) {
+        glog("Stopped BadBLE keyboard.\n");
+        stopped_any = true;
+        (void)badble_manager_stop();
+    }
+#endif
+    if (ble_device_detect_is_active() || ble_device_detect_is_tracking()) {
+        glog("Stopped BLE device detect.\n");
+        stopped_any = true;
+    }
+    ble_device_detect_stop();
     ble_stop();
+    ble_unregister_handler(ble_wardriving_callback);
+    ble_set_suspend_allowed(true);
 #endif
 
     if (csv_buffer_has_pending_data()) { // Only flush if there's data in buffer
@@ -216,6 +250,7 @@ void handle_stop_flipper(int argc, char **argv) {
     snmp_scan_cancel();
     arp_scan_stop_passive();
     port_scan_cancel();
+    name_sniff_stop();
     glog("Stopped network scans.\n");
     stopped_any = true;
 

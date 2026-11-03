@@ -1,3 +1,4 @@
+#include "managers/views/file_browser.h"
  #include "gui/screen_layout.h"
 #include "managers/display_manager.h"
 #include "managers/views/nfc_view.h"
@@ -19,6 +20,8 @@
 #include "gui/popup.h"
 #include "gui/lvgl_safe.h"
 #include "gui/design_tokens.h"
+#include "gui/touch_bar.h"
+#include "gui/gui_router.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,9 +107,7 @@ extern View nfc_view;
 
 static const char *TAG = "NFCView";
 
-// touch nav button sizing
-#define SCROLL_BTN_SIZE 28
-#define SCROLL_BTN_PADDING 3
+// touch nav button sizing now owned by gui/touch_bar.h (GUI_TOUCH_BAR_*)
 
 static options_view_t *g_nfc_ov = NULL;
 
@@ -130,6 +131,7 @@ static lv_obj_t *backend_btn = NULL;
 static lv_obj_t *scroll_up_btn = NULL;
 static lv_obj_t *scroll_down_btn = NULL;
 static lv_obj_t *back_btn = NULL;
+static gui_touch_bar_t s_touch_tb = {0};
 static int selected_index = 0;
 static int num_items = 0; // will be set when building menu
 
@@ -142,6 +144,8 @@ static char **nfc_file_paths = NULL;
 static size_t nfc_file_count = 0;
 static char **nfc_emu_file_paths = NULL;
 static size_t nfc_emu_file_count = 0;
+static char nfc_write_dir[FILE_BROWSER_PATH_MAX] = "/mnt/ghostesp/nfc";
+static char nfc_emulate_dir[FILE_BROWSER_PATH_MAX] = "/mnt/ghostesp/nfc";
 
 // generate-tag flow state
 static bool in_generate_list = false;
@@ -153,6 +157,7 @@ static char g_gen_field3[128] = {0}; // vCard email
 static bool in_saved_list = false;
 static char **saved_file_paths = NULL;
 static size_t saved_file_count = 0;
+static char saved_browse_dir[FILE_BROWSER_PATH_MAX] = "/mnt/ghostesp/nfc";
 
 #ifdef CONFIG_USE_TOUCHSCREEN
 static touch_drag_t nfc_touch_drag = {0};
@@ -214,6 +219,8 @@ static bool saved_details_parsed_view = false;
 static bool saved_has_extra_details = false;
 static char *saved_details_text = NULL;
 static char g_saved_current_path[256] = {0};
+// Deep-link request (favorite launch): saved tag to open on create/live view.
+static char *s_pending_saved_open = NULL;
 static popup_confirm_t *saved_delete_confirm_popup = NULL;
 
 // user mfc keys popup
@@ -1523,7 +1530,7 @@ static bool nfc_init_local_reader_st25r(const char *tag) {
             (gpio_num_t)CONFIG_NFC_SCL_PIN,
             (gpio_num_t)CONFIG_NFC_RST_PIN,
             (gpio_num_t)CONFIG_NFC_IRQ_PIN,
-            I2C_NUM_0,
+            CONFIG_NFC_ST25R3916_I2C_PORT,
             CONFIG_NFC_ST25R3916_I2C_ADDR,
             g_pn532) != ESP_OK) {
         ESP_LOGE(tag, "st25r3916_new_driver_i2c failed");
@@ -2056,7 +2063,7 @@ void nfc_view_input_cb(InputEvent *event) {
             }
             update_nfc_popup_selection();
         }
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_IS_ATOMS3R)
         else if (event->type == INPUT_TYPE_EXIT_BUTTON) {
             // Hardware back button closes the NFC scan popup
             nfc_scan_cancel_cb(NULL);
@@ -2182,7 +2189,7 @@ void nfc_view_input_cb(InputEvent *event) {
             }
             update_saved_popup_selection();
         }
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_IS_ATOMS3R)
         else if (event->type == INPUT_TYPE_EXIT_BUTTON) {
             // Hardware back button closes the saved details popup
             saved_close_cb(NULL);
@@ -2268,7 +2275,7 @@ void nfc_view_input_cb(InputEvent *event) {
                 return;
             }
         }
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_IS_ATOMS3R)
         else if (event->type == INPUT_TYPE_EXIT_BUTTON) {
             nfc_credits_close_cb(NULL);
             return;
@@ -2304,7 +2311,7 @@ void nfc_view_input_cb(InputEvent *event) {
             }
             update_keys_popup_selection();
         }
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_IS_ATOMS3R)
         else if (event->type == INPUT_TYPE_EXIT_BUTTON) {
             // Hardware back button closes the keys popup
             keys_close_cb(NULL);
@@ -2377,7 +2384,7 @@ void nfc_view_input_cb(InputEvent *event) {
             }
             update_cu_popup_selection();
         }
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_IS_ATOMS3R)
         else if (event->type == INPUT_TYPE_EXIT_BUTTON) { cu_close_cb(NULL); return; }
 #endif
         else if (event->type == INPUT_TYPE_JOYSTICK) {
@@ -2463,7 +2470,7 @@ void nfc_view_input_cb(InputEvent *event) {
             }
             update_nfc_write_popup_selection();
         }
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_IS_ATOMS3R)
         else if (event->type == INPUT_TYPE_EXIT_BUTTON) {
             // Hardware back button closes the NFC write popup
             nfc_write_cancel_cb(NULL);
@@ -2510,7 +2517,7 @@ void nfc_view_input_cb(InputEvent *event) {
             int kv = event->data.key_value;
             if (kv == 13 || kv == 10 || kv == 27 || kv == 'c' || kv == 'C' || kv == 29 || kv == '`') { nfc_emu_cancel_cb(NULL); return; }
         }
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_IS_ATOMS3R)
         else if (event->type == INPUT_TYPE_EXIT_BUTTON) { nfc_emu_cancel_cb(NULL); return; }
 #endif
         return;
@@ -2532,35 +2539,20 @@ void nfc_view_input_cb(InputEvent *event) {
                 touch_drag_reset(&nfc_touch_drag);
                 return;
             }
-            if (scroll_up_btn && lv_obj_is_valid(scroll_up_btn) && !lv_obj_has_flag(scroll_up_btn, LV_OBJ_FLAG_HIDDEN)) {
-                lv_area_t a;
-                lv_obj_get_coords(scroll_up_btn, &a);
-                if (d->point.x >= a.x1 && d->point.x <= a.x2 &&
-                    d->point.y >= a.y1 && d->point.y <= a.y2) {
-                    scroll_nfc_up(NULL);
-                    touch_drag_reset(&nfc_touch_drag);
-                    return;
-                }
+            if (gui_touch_bar_hit(scroll_up_btn, d->point.x, d->point.y)) {
+                scroll_nfc_up(NULL);
+                touch_drag_reset(&nfc_touch_drag);
+                return;
             }
-            if (scroll_down_btn && lv_obj_is_valid(scroll_down_btn) && !lv_obj_has_flag(scroll_down_btn, LV_OBJ_FLAG_HIDDEN)) {
-                lv_area_t a;
-                lv_obj_get_coords(scroll_down_btn, &a);
-                if (d->point.x >= a.x1 && d->point.x <= a.x2 &&
-                    d->point.y >= a.y1 && d->point.y <= a.y2) {
-                    scroll_nfc_down(NULL);
-                    touch_drag_reset(&nfc_touch_drag);
-                    return;
-                }
+            if (gui_touch_bar_hit(scroll_down_btn, d->point.x, d->point.y)) {
+                scroll_nfc_down(NULL);
+                touch_drag_reset(&nfc_touch_drag);
+                return;
             }
-            if (back_btn && lv_obj_is_valid(back_btn)) {
-                lv_area_t a;
-                lv_obj_get_coords(back_btn, &a);
-                if (d->point.x >= a.x1 && d->point.x <= a.x2 &&
-                    d->point.y >= a.y1 && d->point.y <= a.y2) {
-                    back_event_cb(NULL);
-                    touch_drag_reset(&nfc_touch_drag);
-                    return;
-                }
+            if (gui_touch_bar_hit(back_btn, d->point.x, d->point.y)) {
+                back_event_cb(NULL);
+                touch_drag_reset(&nfc_touch_drag);
+                return;
             }
             if (!nfc_touch_drag.started) {
                 touch_drag_begin(&nfc_touch_drag, d);
@@ -2640,7 +2632,7 @@ void nfc_view_input_cb(InputEvent *event) {
                 return;
             }
         }
-        if (nfc_is_submenu_open()) back_to_root_menu(); else display_manager_go_back();
+        back_event_cb(NULL);
 #endif
     } else if (event->type == INPUT_TYPE_JOYSTICK) {
         int btn = event->data.joystick_index;
@@ -2652,7 +2644,7 @@ void nfc_view_input_cb(InputEvent *event) {
             lv_obj_t *selected_obj = lv_obj_get_child(menu_container, selected_index);
             if (selected_obj) lv_event_send(selected_obj, LV_EVENT_CLICKED, NULL);
         } else if (btn == 0) {
-            if (nfc_is_submenu_open()) back_to_root_menu(); else display_manager_go_back();
+            back_event_cb(NULL);
         }
     } else if (event->type == INPUT_TYPE_ENCODER) {
         if (event->data.encoder.button) {
@@ -2674,11 +2666,11 @@ void nfc_view_input_cb(InputEvent *event) {
         } else if (kv == 47 || kv == '/' || kv == 46 || kv == '.') {
             if (g_nfc_ov) { options_view_move_selection(g_nfc_ov, 1); selected_index = options_view_get_selected(g_nfc_ov); }
         } else if (kv == 29 || kv == '`') {
-            if (nfc_is_submenu_open()) back_to_root_menu(); else display_manager_go_back();
+            back_event_cb(NULL);
         }
-#ifdef CONFIG_USE_ENCODER
+#if defined(CONFIG_USE_ENCODER) || defined(CONFIG_IS_ATOMS3R)
     } else if (event->type == INPUT_TYPE_EXIT_BUTTON) {
-        if (nfc_is_submenu_open()) back_to_root_menu(); else display_manager_go_back();
+        back_event_cb(NULL);
 #endif
     }
 }
@@ -2732,12 +2724,14 @@ void nfc_option_event_cb(lv_event_t *e) {
     }
 
     if (strcmp(opt, "Emulate") == 0) {
+        strcpy(nfc_emulate_dir, "/mnt/ghostesp/nfc");
         nfc_enter_emulate_list();
         nfc_option_invoked = false;
         return;
     }
 
     if (strcmp(opt, "Write") == 0) {
+        strcpy(nfc_write_dir, "/mnt/ghostesp/nfc");
         nfc_enter_write_list();
         nfc_option_invoked = false;
         return;
@@ -2750,6 +2744,7 @@ void nfc_option_event_cb(lv_event_t *e) {
     }
 
     if (strcmp(opt, "Saved") == 0) {
+        strcpy(saved_browse_dir, "/mnt/ghostesp/nfc");
         saved_enter_list();
         nfc_option_invoked = false;
         return;
@@ -2777,29 +2772,7 @@ void nfc_option_event_cb(lv_event_t *e) {
 }
 
 static void update_nfc_scroll_buttons_visibility(void) {
-#ifdef CONFIG_USE_TOUCHSCREEN
-    if (!menu_container || !lv_obj_is_valid(menu_container)) return;
-    lv_obj_update_layout(menu_container);
-    lv_coord_t sb = lv_obj_get_scroll_bottom(menu_container);
-    lv_coord_t st = lv_obj_get_scroll_top(menu_container);
-    bool needs_scroll = (sb > 0) || (st > 0);
-    if (needs_scroll) {
-        if (scroll_up_btn && lv_obj_is_valid(scroll_up_btn)) {
-            lv_obj_clear_flag(scroll_up_btn, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_move_foreground(scroll_up_btn);
-        }
-        if (scroll_down_btn && lv_obj_is_valid(scroll_down_btn)) {
-            lv_obj_clear_flag(scroll_down_btn, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_move_foreground(scroll_down_btn);
-        }
-        if (back_btn && lv_obj_is_valid(back_btn)) {
-            lv_obj_move_foreground(back_btn);
-        }
-    } else {
-        if (scroll_up_btn && lv_obj_is_valid(scroll_up_btn)) lv_obj_add_flag(scroll_up_btn, LV_OBJ_FLAG_HIDDEN);
-        if (scroll_down_btn && lv_obj_is_valid(scroll_down_btn)) lv_obj_add_flag(scroll_down_btn, LV_OBJ_FLAG_HIDDEN);
-    }
-#endif
+    gui_touch_bar_update_visibility(&s_touch_tb, menu_container);
 }
 
 static void scroll_nfc_up(lv_event_t *e) {
@@ -2815,6 +2788,18 @@ static void scroll_nfc_down(lv_event_t *e) {
     update_nfc_scroll_buttons_visibility();
 }
 static void back_event_cb(lv_event_t *e) {
+    if (in_write_list && file_browser_parent(nfc_write_dir, "/mnt/ghostesp/nfc")) {
+        nfc_enter_write_list();
+        return;
+    }
+    if (in_emulate_list && file_browser_parent(nfc_emulate_dir, "/mnt/ghostesp/nfc")) {
+        nfc_enter_emulate_list();
+        return;
+    }
+    if (in_saved_list && file_browser_parent(saved_browse_dir, "/mnt/ghostesp/nfc")) {
+        saved_enter_list();
+        return;
+    }
     if (nfc_is_submenu_open()) back_to_root_menu();
     else display_manager_go_back();
 }
@@ -3811,6 +3796,10 @@ static void nfc_clear_emulate_list(void) {
 static void nfc_file_item_cb(lv_event_t *e) {
     const char *path = (const char *)lv_event_get_user_data(e);
     if (!path) return;
+    if (file_browser_is_dir(path)) {
+        if (file_browser_enter(nfc_write_dir, sizeof(nfc_write_dir), path)) nfc_enter_write_list();
+        return;
+    }
     create_nfc_write_popup(path);
 }
 
@@ -4225,38 +4214,15 @@ static void nfc_enter_write_list(void) {
     backend_btn = NULL;
 #endif
 
-    const char *dir = "/mnt/ghostesp/nfc";
-    bool susp = false; bool did = nfc_sd_begin(&susp);
-    DIR *d = did ? opendir(dir) : NULL;
-    if (d) {
-        struct dirent *de;
-        size_t count = 0;
-        while ((de = readdir(d)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            if (has_nfc_ext(de->d_name)) count++;
-        }
-        rewinddir(d);
-        if (count > 0) nfc_file_paths = (char**)calloc(count, sizeof(char*));
-        size_t idx = 0;
-        while ((de = readdir(d)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            if (!has_nfc_ext(de->d_name)) continue;
-            size_t need = strlen(dir) + 1 + strlen(de->d_name) + 1;
-            char *copy = (char*)malloc(need);
-            if (!copy) continue;
-            snprintf(copy, need, "%s/%s", dir, de->d_name);
-            if (nfc_file_paths && idx < count) nfc_file_paths[idx++] = copy;
-            ESP_LOGI(TAG, "nfc_enter_write_list: %s", copy);
-            options_view_add_item(g_nfc_ov, de->d_name, nfc_file_item_cb, copy);
-        }
-        nfc_file_count = idx;
-        ESP_LOGI(TAG, "nfc_enter_write_list: %u .nfc files", (unsigned)nfc_file_count);
-        closedir(d);
+    bool susp = false;
+    bool did = nfc_sd_begin(&susp);
+    if (did) file_browser_read(nfc_write_dir, has_nfc_ext, 0, (size_t)-1,
+                              &nfc_file_paths, &nfc_file_count, NULL);
+    if (did) nfc_sd_end(susp);
+    for (size_t i = 0; i < nfc_file_count; i++) {
+        options_view_add_item(g_nfc_ov, file_browser_name(nfc_file_paths[i]), nfc_file_item_cb, nfc_file_paths[i]);
     }
-
-    if (nfc_file_count == 0) {
-        options_view_add_item(g_nfc_ov, "No .nfc files", NULL, NULL);
-    }
+    if (nfc_file_count == 0) options_view_add_item(g_nfc_ov, "No .nfc files", NULL, NULL);
 
 #if defined(CONFIG_USE_ENCODER) || defined(CONFIG_USE_JOYSTICK)
     options_view_add_back_row(g_nfc_ov, back_event_cb, NULL);
@@ -4264,7 +4230,7 @@ static void nfc_enter_write_list(void) {
     num_items = options_view_get_item_count(g_nfc_ov);
     selected_index = 0;
     options_view_set_selected(g_nfc_ov, 0);
-    if (did) nfc_sd_end(susp);
+    update_nfc_scroll_buttons_visibility();
 }
 
 static void nfc_enter_emulate_list(void) {
@@ -4278,33 +4244,15 @@ static void nfc_enter_emulate_list(void) {
 
     options_view_add_item(g_nfc_ov, "NDEF URL Test", nfc_emulate_test_cb, NULL);
 
-    const char *dir = "/mnt/ghostesp/nfc";
-    bool susp = false; bool did = nfc_sd_begin(&susp);
-    DIR *d = did ? opendir(dir) : NULL;
-    if (d) {
-        struct dirent *de;
-        size_t count = 0;
-        while ((de = readdir(d)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            if (has_nfc_ext(de->d_name)) count++;
-        }
-        rewinddir(d);
-        if (count > 0) nfc_emu_file_paths = (char**)calloc(count, sizeof(char*));
-        size_t idx = 0;
-        while ((de = readdir(d)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            if (!has_nfc_ext(de->d_name)) continue;
-            size_t need = strlen(dir) + 1 + strlen(de->d_name) + 1;
-            char *copy = (char*)malloc(need);
-            if (!copy) continue;
-            snprintf(copy, need, "%s/%s", dir, de->d_name);
-            if (nfc_emu_file_paths && idx < count) nfc_emu_file_paths[idx++] = copy;
-            options_view_add_item(g_nfc_ov, de->d_name, nfc_emulate_file_item_cb, copy);
-        }
-        nfc_emu_file_count = idx;
-        closedir(d);
-    }
+    bool susp = false;
+    bool did = nfc_sd_begin(&susp);
+    if (did) file_browser_read(nfc_emulate_dir, has_nfc_ext, 0, (size_t)-1,
+                              &nfc_emu_file_paths, &nfc_emu_file_count, NULL);
     if (did) nfc_sd_end(susp);
+    for (size_t i = 0; i < nfc_emu_file_count; i++) {
+        options_view_add_item(g_nfc_ov, file_browser_name(nfc_emu_file_paths[i]), nfc_emulate_file_item_cb, nfc_emu_file_paths[i]);
+    }
+    if (nfc_emu_file_count == 0) options_view_add_item(g_nfc_ov, "No .nfc files", NULL, NULL);
 
 #if defined(CONFIG_USE_ENCODER) || defined(CONFIG_USE_JOYSTICK)
     options_view_add_back_row(g_nfc_ov, back_event_cb, NULL);
@@ -4327,6 +4275,10 @@ void saved_clear_list(void) {
 static void saved_file_item_cb(lv_event_t *e) {
     const char *path = (const char *)lv_event_get_user_data(e);
     if (!path) return;
+    if (file_browser_is_dir(path)) {
+        if (file_browser_enter(saved_browse_dir, sizeof(saved_browse_dir), path)) saved_enter_list();
+        return;
+    }
     create_saved_details_popup(path);
 }
 
@@ -4339,34 +4291,14 @@ static void saved_enter_list(void) {
     backend_btn = NULL;
 #endif
 
-    const char *dir = "/mnt/ghostesp/nfc";
-    bool susp = false; bool did = nfc_sd_begin(&susp);
-    DIR *d = did ? opendir(dir) : NULL;
-    if (d) {
-        struct dirent *de; size_t count = 0;
-        while ((de = readdir(d)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            if (has_nfc_ext(de->d_name)) count++;
-        }
-        rewinddir(d);
-        if (count > 0) saved_file_paths = (char**)calloc(count, sizeof(char*));
-        size_t idx = 0;
-        while ((de = readdir(d)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            if (!has_nfc_ext(de->d_name)) continue;
-            size_t need = strlen(dir) + 1 + strlen(de->d_name) + 1;
-            char *copy = (char*)malloc(need);
-            if (!copy) continue;
-            snprintf(copy, need, "%s/%s", dir, de->d_name);
-            if (saved_file_paths && idx < count) saved_file_paths[idx++] = copy;
-            ESP_LOGI(TAG, "saved_enter_list: %s", copy);
-            options_view_add_item(g_nfc_ov, de->d_name, saved_file_item_cb, copy);
-        }
-        saved_file_count = idx;
-        ESP_LOGI(TAG, "saved_enter_list: %u .nfc files", (unsigned)saved_file_count);
-        closedir(d);
-    }
+    bool susp = false;
+    bool did = nfc_sd_begin(&susp);
+    if (did) file_browser_read(saved_browse_dir, has_nfc_ext, 0, (size_t)-1,
+                              &saved_file_paths, &saved_file_count, NULL);
     if (did) nfc_sd_end(susp);
+    for (size_t i = 0; i < saved_file_count; i++) {
+        options_view_add_item(g_nfc_ov, file_browser_name(saved_file_paths[i]), saved_file_item_cb, saved_file_paths[i]);
+    }
 
     if (saved_file_count == 0) {
         options_view_add_item(g_nfc_ov, "No .nfc files", NULL, NULL);
@@ -4481,6 +4413,10 @@ static void nfc_emulate_test_cb(lv_event_t *e) {
 static void nfc_emulate_file_item_cb(lv_event_t *e) {
     const char *path = (const char *)lv_event_get_user_data(e);
     if (!path) return;
+    if (file_browser_is_dir(path)) {
+        if (file_browser_enter(nfc_emulate_dir, sizeof(nfc_emulate_dir), path)) nfc_enter_emulate_list();
+        return;
+    }
     create_nfc_emu_popup(path, false);
 }
 
@@ -5963,6 +5899,36 @@ static void nfc_write_go_cb(lv_event_t *e) {
 
 // ---- End Write Flow ----
 
+// Deep-link support for favorites: open the Saved list and show the details
+// popup for a specific tag file. Safe to call before the view exists.
+static void nfc_view_apply_pending_open(void);
+void nfc_view_open_saved(const char *path) {
+    if (!path || !path[0]) return;
+    free(s_pending_saved_open);
+    s_pending_saved_open = strdup(path);
+    if (g_nfc_ov && lv_obj_is_valid(g_nfc_ov)) {
+        nfc_view_apply_pending_open();
+    }
+}
+
+static void nfc_view_apply_pending_open(void) {
+    if (!s_pending_saved_open) return;
+    char path[256];
+    strncpy(path, s_pending_saved_open, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    free(s_pending_saved_open);
+    s_pending_saved_open = NULL;
+    char *slash = strrchr(path, '/');
+    const char *browse_root = "/mnt/ghostesp/nfc";
+    if (slash && strncmp(path, browse_root, strlen(browse_root)) == 0 && path[strlen(browse_root)] == '/') {
+        size_t len = (size_t)(slash - path);
+        memcpy(saved_browse_dir, path, len);
+        saved_browse_dir[len] = '\0';
+    }
+    saved_enter_list();
+    create_saved_details_popup(path);
+}
+
 void nfc_view_create(void) {
     lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_SCROLLABLE);
     root = gui_screen_create_root_no_bg(NULL, NULL, lv_color_hex(GUI_DEFAULT_BG_COLOR), LV_OPA_TRANSP);
@@ -5975,68 +5941,18 @@ void nfc_view_create(void) {
 
 #ifdef CONFIG_USE_TOUCHSCREEN
     const int STATUS_BAR_HEIGHT = GUI_STATUS_BAR_H;
-    const int TOUCH_BAR_HEIGHT = SCROLL_BTN_SIZE + SCROLL_BTN_PADDING * 2;
+    const int TOUCH_BAR_HEIGHT = gui_touch_bar_height();
     int container_height = LV_VER_RES - STATUS_BAR_HEIGHT - TOUCH_BAR_HEIGHT;
-    lv_obj_set_size(menu_container, LV_HOR_RES, container_height);
+    lv_obj_set_size(menu_container, GUI_OPTIONS_LIST_WIDTH, container_height);
     lv_obj_align(menu_container, LV_ALIGN_TOP_MID, 0, STATUS_BAR_HEIGHT);
 
-    uint8_t theme = settings_get_menu_theme(&G_Settings);
-    lv_color_t bg_color = lv_color_hex(theme_palette_get_background(theme));
-    lv_color_t ctrl_color = lv_color_hex(theme_palette_get_surface_alt(theme));
-    lv_color_t ctrl_text = lv_color_hex(theme_palette_get_text(theme));
-
-    lv_obj_t *touch_bar = lv_obj_create(root);
-    lv_obj_remove_style_all(touch_bar);
-    lv_obj_set_size(touch_bar, LV_HOR_RES, TOUCH_BAR_HEIGHT);
-    lv_obj_align(touch_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(touch_bar, bg_color, 0);
-    lv_obj_set_style_bg_opa(touch_bar, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(touch_bar, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-
-    scroll_up_btn = lv_btn_create(touch_bar);
-    gui_apply_pressed_style(scroll_up_btn);
-    lv_obj_set_size(scroll_up_btn, SCROLL_BTN_SIZE, SCROLL_BTN_SIZE);
-    lv_obj_align(scroll_up_btn, LV_ALIGN_LEFT_MID, SCROLL_BTN_PADDING, 0);
-    lv_obj_set_style_bg_color(scroll_up_btn, ctrl_color, LV_PART_MAIN);
-    lv_obj_set_style_radius(scroll_up_btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_border_width(scroll_up_btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(scroll_up_btn, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(scroll_up_btn, scroll_nfc_up, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *up_label = lv_label_create(scroll_up_btn);
-    lv_label_set_text(up_label, LV_SYMBOL_UP);
-    lv_obj_set_style_text_color(up_label, ctrl_text, 0);
-    lv_obj_center(up_label);
-    lv_obj_add_flag(scroll_up_btn, LV_OBJ_FLAG_HIDDEN);
-
-    back_btn = lv_btn_create(touch_bar);
-    gui_apply_pressed_style(back_btn);
-    lv_obj_set_size(back_btn, SCROLL_BTN_SIZE + 24, SCROLL_BTN_SIZE);
-    lv_obj_align(back_btn, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(back_btn, ctrl_color, LV_PART_MAIN);
-    lv_obj_set_style_radius(back_btn, 5, LV_PART_MAIN);
-    lv_obj_set_style_pad_hor(back_btn, 8, LV_PART_MAIN);
-    lv_obj_set_style_border_width(back_btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(back_btn, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(back_btn, back_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *back_label = lv_label_create(back_btn);
-    lv_label_set_text(back_label, "Back");
-    lv_obj_set_style_text_color(back_label, ctrl_text, 0);
-    lv_obj_center(back_label);
-
-    scroll_down_btn = lv_btn_create(touch_bar);
-    gui_apply_pressed_style(scroll_down_btn);
-    lv_obj_set_size(scroll_down_btn, SCROLL_BTN_SIZE, SCROLL_BTN_SIZE);
-    lv_obj_align(scroll_down_btn, LV_ALIGN_RIGHT_MID, -SCROLL_BTN_PADDING, 0);
-    lv_obj_set_style_bg_color(scroll_down_btn, ctrl_color, LV_PART_MAIN);
-    lv_obj_set_style_radius(scroll_down_btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_border_width(scroll_down_btn, 0, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(scroll_down_btn, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(scroll_down_btn, scroll_nfc_down, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *down_label = lv_label_create(scroll_down_btn);
-    lv_label_set_text(down_label, LV_SYMBOL_DOWN);
-    lv_obj_set_style_text_color(down_label, ctrl_text, 0);
-    lv_obj_center(down_label);
-    lv_obj_add_flag(scroll_down_btn, LV_OBJ_FLAG_HIDDEN);
+    s_touch_tb = gui_touch_bar_create(root);
+    scroll_up_btn = s_touch_tb.up_btn;
+    back_btn = s_touch_tb.back_btn;
+    scroll_down_btn = s_touch_tb.down_btn;
+    if (s_touch_tb.bar != NULL) {
+        gui_touch_bar_set_callbacks(&s_touch_tb, scroll_nfc_up, NULL, back_event_cb, NULL, scroll_nfc_down, NULL);
+    }
 #endif
 
     scan_btn = options_view_add_item(g_nfc_ov, "Scan", nfc_option_event_cb, (void *)"Scan");
@@ -6062,7 +5978,7 @@ void nfc_view_create(void) {
      * elsewhere and back) restores the previously highlighted row instead
      * of always landing on the first item. Submenu state (in_saved_list
      * etc.) still always resets to root on re-entry, unchanged. */
-    if (display_manager_previous_view == &main_menu_view) {
+    if (gui_router_previous_view() == &main_menu_view) {
         selected_index = 0;
     } else if (selected_index < 0 || selected_index >= num_items) {
         selected_index = 0;
@@ -6078,6 +5994,9 @@ void nfc_view_create(void) {
 #ifdef CONFIG_USE_TOUCHSCREEN
     update_nfc_scroll_buttons_visibility();
 #endif
+
+    // Consume any pending favorite deep-link (nfc_view_open_saved).
+    nfc_view_apply_pending_open();
 }
 
 void nfc_view_destroy(void) {
@@ -6114,6 +6033,7 @@ void nfc_view_destroy(void) {
     menu_container = NULL;
     scan_btn = NULL;
     emulate_btn = NULL;
+    gui_touch_bar_destroy(&s_touch_tb);
     scroll_up_btn = NULL;
     scroll_down_btn = NULL;
     back_btn = NULL;

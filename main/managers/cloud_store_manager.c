@@ -1,6 +1,7 @@
 #include "managers/cloud_store_manager.h"
 
 #include "cJSON.h"
+#include "core/memory_debug.h"
 #include "core/system_manager.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
@@ -14,6 +15,7 @@
 #include "managers/sd_card_manager.h"
 #include "managers/ghostscript_manager.h"
 #include "managers/settings_manager.h"
+#include "managers/wifi_manager.h"
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -47,14 +49,20 @@
 #define CLOUD_CATALOG_MAX_SIZE (256 * 1024)
 #define CLOUD_DOWNLOAD_RANGE_CHUNK_SIZE (32 * 1024)
 #define CLOUD_DOWNLOAD_RANGE_ATTEMPTS 5
-#ifdef CONFIG_SPIRAM
-#define CLOUD_INSTALL_TASK_STACK_BYTES 12288
-#else
-// The Cloud Store keeps the AP stopped on no-PSRAM boards, but their heap can
-// still be fragmented enough that a 12 KB task stack cannot be allocated.
-#define CLOUD_INSTALL_TASK_STACK_BYTES 8192
-#endif
-#define CLOUD_INSTALL_TASK_FALLBACK_STACK_BYTES 6144
+// Both Cloud Store tasks run a full mbedTLS handshake before any HTTP data
+// flows: X.509 chain parsing plus ECDSA P-256 verification. The stack cost is
+// call-chain depth (esp_http_client -> esp_tls -> ssl_handshake -> x509 -> ecp),
+// not big-integer scratch: that lands on the heap in this mbedTLS, and on
+// no-PSRAM boards the heap is the scarce resource. Measured peak on an ESP32 CYD
+// build is 5900 bytes, so 8 KB keeps ~2 KB spare while handing 4 KB back to the
+// heap the handshake itself needs. The 12288 this replaced matched
+// OTA_DOWNLOAD_TASK_STACK_BYTES by analogy, not by measurement. log_stack_hwm()
+// re-reports the real peak on every run; the 5900 figure came from a handshake
+// that aborted at chain verification, so a successful one goes a little deeper.
+// The install task is aliased here but is not measured yet -- split it out if
+// its high-water mark comes back thin.
+#define CLOUD_TLS_TASK_STACK_BYTES 8192
+#define CLOUD_INSTALL_TASK_STACK_BYTES CLOUD_TLS_TASK_STACK_BYTES
 #define CLOUD_DOWNLOAD_DIR "/mnt/ghostesp/downloads"
 #define CLOUD_THEMES_DIR "/mnt/ghostesp/themes"
 #define CLOUD_SCRIPTS_DIR GHOSTSCRIPT_ROOT_DIR
@@ -86,6 +94,7 @@ typedef struct {
     size_t buf_cap;
     bool jit;                // flushes mount/unmount only on JIT boards
     bool file_started;       // first flush of an attempt truncates ("wb"), rest append ("ab")
+    size_t resume_off;       // byte offset this attempt resumes from (Range request)
 } download_ctx_t;
 
 // Push a live download update to the UI at most every ~4KB so the progress
@@ -108,6 +117,7 @@ typedef struct {
 typedef struct {
     cloud_store_item_type_t type;
     char id[CLOUD_STORE_ID_MAX];
+    bool caps_task;
 } install_request_t;
 
 typedef struct {
@@ -235,7 +245,7 @@ static void cloud_store_restore_ap_if_needed(void) {
     s_ap_paused_for_cloud = false;
     if (settings_get_ap_enabled(&G_Settings)) {
         ESP_LOGI(TAG, "Restoring AP/Web UI services after Cloud Store network request");
-        ap_manager_start_services();
+        (void)ap_manager_restore_after_attack("cloud store");
     }
 #endif
 }
@@ -328,18 +338,21 @@ static esp_err_t fetch_url_text(const char *url, char **out_text) {
         free(resp.buffer);
         return proxy_err;
     }
+    memory_debug_log_snapshot("cloud catalog before");
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         free(resp.buffer);
-        return ESP_FAIL;
+        memory_debug_log_snapshot("cloud catalog client alloc failed");
+        return ESP_ERR_NO_MEM;
     }
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    memory_debug_log_snapshot("cloud catalog after");
     if (err != ESP_OK || status != 200) {
         ESP_LOGW(TAG, "catalog fetch failed url=%s err=%s http=%d", url, esp_err_to_name(err), status);
         free(resp.buffer);
-        return ESP_FAIL;
+        return err != ESP_OK ? err : ESP_FAIL;
     }
     if (!resp.buffer) {
         resp.buffer = strdup("");
@@ -876,8 +889,16 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
     if (s_ctx && s_ctx->cancel_requested) return ESP_FAIL;
 
     if (evt->event_id == HTTP_EVENT_ON_HEADER) {
-        if (evt->header_key && evt->header_value &&
-            strcasecmp(evt->header_key, "Content-Length") == 0) {
+        if (!evt->header_key || !evt->header_value) return ESP_OK;
+        if (strcasecmp(evt->header_key, "Content-Range") == 0) {
+            // "bytes <first>-<last>/<total>" -- authoritative full size on a
+            // 206 response, where Content-Length is only the remaining bytes.
+            const char *slash = strrchr(evt->header_value, '/');
+            if (slash) {
+                long len = atol(slash + 1);
+                if (len > 0) ctx->total = (size_t)len;
+            }
+        } else if (strcasecmp(evt->header_key, "Content-Length") == 0 && ctx->total == 0) {
             long len = atol(evt->header_value);
             if (len > 0) ctx->total = (size_t)len;
         }
@@ -891,6 +912,23 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
         ctx->ok = false;
         ESP_LOGW(TAG, "download body rejected: HTTP %d", status);
         return ESP_FAIL;
+    }
+
+    // A resume that comes back as 200 means the server ignored the Range
+    // header and is streaming the whole body: discard the partial file and
+    // restart byte accounting from zero so the result stays contiguous.
+    if (ctx->resume_off > 0 && status == 200) {
+        ESP_LOGW(TAG, "server ignored Range resume at %u; restarting from 0",
+                 (unsigned)ctx->resume_off);
+        ctx->resume_off = 0;
+        ctx->written = 0;
+        ctx->buf_len = 0;
+        ctx->file_started = false;
+        if (ctx->file) {
+            fclose(ctx->file);
+            ctx->file = NULL;
+        }
+        remove(ctx->path);
     }
 
     if (ctx->buf) {
@@ -913,7 +951,8 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
     } else {
         // Open lazily after validating the response so an HTTP error cannot
         // truncate a prior package or leave its error page on the SD card.
-        if (!ctx->file) ctx->file = fopen(ctx->path, "wb");
+        // A resumed attempt appends to the partial file it continues from.
+        if (!ctx->file) ctx->file = fopen(ctx->path, ctx->resume_off > 0 ? "ab" : "wb");
         if (!ctx->file || fwrite(evt->data, 1, evt->data_len, ctx->file) != (size_t)evt->data_len) {
             ctx->ok = false;
             return ESP_FAIL;
@@ -960,16 +999,27 @@ static esp_err_t download_with_retries(const cloud_store_item_t *item, const cha
     }
 
     esp_err_t result = ESP_FAIL;
-    for (int attempt = 1; attempt <= CLOUD_DOWNLOAD_RANGE_ATTEMPTS; ++attempt) {
+    // Byte offset already safely on the SD card across attempts. Transient
+    // connection drops resume from here with a Range request instead of
+    // throwing away everything fetched so far (large packages die repeatedly
+    // at the same early offset otherwise -- e.g. the TLS link being reset
+    // ~50KB in -- and can never finish).
+    size_t done = 0;
+    int stalled = 0; // consecutive attempts that added zero bytes
+    int attempt = 0;
+    while (stalled < CLOUD_DOWNLOAD_RANGE_ATTEMPTS) {
         if (s_ctx && s_ctx->cancel_requested) { result = ESP_FAIL; break; }
-        ctx.written = 0;
-        ctx.last_reported = 0;
+        attempt++;
+        size_t done_at_start = done;
+        ctx.written = done;
+        ctx.last_reported = done;
         ctx.last_report_tick = xTaskGetTickCount();
-        ctx.total = 0;
+        if (done == 0) ctx.total = 0; // keep the full size learned on a resume
         ctx.ok = true;
         ctx.buf_len = 0;
-        ctx.file_started = false;
+        ctx.file_started = done > 0; // resumed flushes append to the partial file
         ctx.file = NULL;
+        ctx.resume_off = done;
 
         // Direct mode holds the SD mount on a JIT board for the whole transfer.
         // Its output file opens only after the first successful response byte.
@@ -1005,29 +1055,59 @@ static esp_err_t download_with_retries(const cloud_store_item_t *item, const cha
             result = ESP_FAIL;
             break;
         }
+        if (done > 0) {
+            char range_hdr[32];
+            snprintf(range_hdr, sizeof(range_hdr), "bytes=%u-", (unsigned)done);
+            esp_http_client_set_header(client, "Range", range_hdr);
+        }
 
         esp_err_t err = esp_http_client_perform(client);
         int status = esp_http_client_get_status_code(client);
         esp_http_client_cleanup(client);
 
-        ESP_LOGI(TAG, "download attempt %d: err=%s http=%d written=%u total=%u",
-                 attempt, esp_err_to_name(err), status, (unsigned)ctx.written, (unsigned)ctx.total);
+        ESP_LOGI(TAG, "download attempt %d: err=%s http=%d written=%u total=%u resume_from=%u",
+                 attempt, esp_err_to_name(err), status, (unsigned)ctx.written,
+                 (unsigned)ctx.total, (unsigned)done_at_start);
 
-        // Flush whatever tail is still staged before judging completeness.
-        if (ctx.buf && ctx.ok && err == ESP_OK && !(s_ctx && s_ctx->cancel_requested)) {
+        // Flush whatever tail is still staged before judging completeness --
+        // also on transport errors, so the bytes already received survive as
+        // the resume point for the next attempt.
+        if (ctx.buf && ctx.ok && !(s_ctx && s_ctx->cancel_requested)) {
             if (download_flush_buffer(&ctx) != ESP_OK) ctx.ok = false;
         }
         if (ctx.file) { fclose(ctx.file); ctx.file = NULL; }
         if (direct_mounted) sd_card_jit_end(direct_suspended);
+
+        // Only count bytes that were actually persisted to the SD card.
+        if (ctx.ok && !(s_ctx && s_ctx->cancel_requested) && ctx.written > done) {
+            done = ctx.written;
+        }
+        bool progressed = done > done_at_start;
 
         if (ctx.written > 0 || ctx.total > 0) {
             set_status(CLOUD_STORE_STATE_DOWNLOADING, item->name, ctx.written, ctx.total, NULL);
         }
 
         if (s_ctx && s_ctx->cancel_requested) { result = ESP_FAIL; break; }
+        // Every byte is already on the SD card: a transport error on the very
+        // last read must not discard a fully received package (the follow-up
+        // Range request would be unsatisfiable and fail the install).
+        if (ctx.total > 0 && done >= ctx.total) {
+            result = ESP_OK;
+            break;
+        }
         if (err != ESP_OK || !ctx.ok || (status != 200 && status != 206)) {
-            ESP_LOGW(TAG, "Download failed err=%s http=%d written=%u total=%u",
-                     esp_err_to_name(err), status, (unsigned)ctx.written, (unsigned)ctx.total);
+            // A dropped connection that still delivered bytes is normal on
+            // flaky links -- the download resumes from the persisted offset,
+            // so log it as routine progress, not a failure. Only attempts that
+            // advanced nothing are worth a warning.
+            if (progressed) {
+                ESP_LOGI(TAG, "connection dropped at %u/%u, resuming",
+                         (unsigned)done, (unsigned)ctx.total);
+            } else {
+                ESP_LOGW(TAG, "Download failed err=%s http=%d written=%u total=%u",
+                         esp_err_to_name(err), status, (unsigned)ctx.written, (unsigned)ctx.total);
+            }
             // A missing/unauthorized package will not appear on a retry. Keep
             // retrying transient server and transport failures instead.
             if (status >= 400 && status < 500 && status != 408 && status != 429) {
@@ -1035,15 +1115,23 @@ static esp_err_t download_with_retries(const cloud_store_item_t *item, const cha
                 result = ESP_FAIL;
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(400 * attempt));
+            if (progressed) stalled = 0; else stalled++;
+            vTaskDelay(pdMS_TO_TICKS(400 * (stalled > 0 ? stalled : 1)));
             continue;
         }
-        if ((ctx.total > 0 && ctx.written == ctx.total) || (ctx.total == 0 && ctx.written > 0)) {
+        if ((ctx.total > 0 && ctx.written >= ctx.total) || (ctx.total == 0 && ctx.written > 0)) {
             result = ESP_OK;
             break;
         }
-        ESP_LOGW("CloudStore", "Incomplete download: %d/%d bytes, retrying", (int)ctx.written, (int)ctx.total);
-        vTaskDelay(pdMS_TO_TICKS(400 * attempt));
+        if (progressed) {
+            ESP_LOGI(TAG, "incomplete response at %u/%u, resuming",
+                     (unsigned)done, (unsigned)ctx.total);
+        } else {
+            ESP_LOGW(TAG, "Incomplete download: %u/%u bytes, retrying",
+                     (unsigned)ctx.written, (unsigned)ctx.total);
+        }
+        if (progressed) stalled = 0; else stalled++;
+        vTaskDelay(pdMS_TO_TICKS(400 * (stalled > 0 ? stalled : 1)));
     }
 
     free(ctx.buf);
@@ -1069,6 +1157,99 @@ static void recover_script_install(const char *final_gsb, const char *manifest_p
             ESP_LOGW(TAG, "manifest backup restore failed: %s", manifest_path);
         }
     }
+}
+
+// Kept out of install_item so its ~1 KB of path buffers are not part of the
+// frame every install (notably .gapp apps, which recurse deeper) runs under.
+static __attribute__((noinline)) esp_err_t install_script_item(const cloud_store_item_t *item, const char *download_path) {
+    esp_err_t err = ESP_OK;
+    char script_dir[128];
+    int n = snprintf(script_dir, sizeof(script_dir), "%s/%s", CLOUD_SCRIPTS_DIR, item->id);
+    if (n <= 0 || (size_t)n >= sizeof(script_dir)) {
+        err = ESP_ERR_INVALID_SIZE;
+        ESP_LOGW(TAG, "script dir path too long for %s", item->id);
+    } else {
+        mkdir_if_missing(script_dir);
+        char final_gsb[160];
+        snprintf(final_gsb, sizeof(final_gsb), "%s/%s.gsb", script_dir, item->id);
+        char entry_name[CLOUD_STORE_ID_MAX + 8];
+        snprintf(entry_name, sizeof(entry_name), "%s.gsb", item->id);
+        char manifest_path[160];
+        snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", script_dir);
+        char manifest_tmp_path[164];
+        snprintf(manifest_tmp_path, sizeof(manifest_tmp_path), "%s.tmp", manifest_path);
+        recover_script_install(final_gsb, manifest_path);
+        cJSON *manifest = cJSON_CreateObject();
+        cJSON *permissions = manifest ? cJSON_AddArrayToObject(manifest, "permissions") : NULL;
+        bool manifest_ok = manifest && permissions &&
+                           cJSON_AddStringToObject(manifest, "id", item->id) &&
+                           cJSON_AddStringToObject(manifest, "name", item->name) &&
+                           cJSON_AddStringToObject(manifest, "entry", entry_name) &&
+                           cJSON_AddNumberToObject(manifest, "memory_limit", item->script_memory_limit);
+        for (uint32_t bit = 0; manifest_ok && bit < 32; ++bit) {
+            uint32_t permission = 1u << bit;
+            if ((item->script_permissions & permission) == 0) continue;
+            const char *name = script_permission_name(permission);
+            if (!name || !cJSON_AddItemToArray(permissions, cJSON_CreateString(name))) {
+                manifest_ok = false;
+            }
+        }
+        unlink(manifest_tmp_path);
+        char *manifest_json = manifest_ok ? cJSON_PrintUnformatted(manifest) : NULL;
+        FILE *mf = manifest_json ? fopen(manifest_tmp_path, "w") : NULL;
+        if (!mf) {
+            manifest_ok = false;
+        } else {
+            bool write_ok = fputs(manifest_json, mf) >= 0;
+            bool close_ok = fclose(mf) == 0;
+            manifest_ok = manifest_ok && write_ok && close_ok;
+        }
+        free(manifest_json);
+        cJSON_Delete(manifest);
+
+        char gsb_backup[164];
+        char manifest_backup[164];
+        snprintf(gsb_backup, sizeof(gsb_backup), "%s.bak", final_gsb);
+        snprintf(manifest_backup, sizeof(manifest_backup), "%s.bak", manifest_path);
+        struct stat st;
+        bool had_gsb = stat(final_gsb, &st) == 0;
+        bool had_manifest = stat(manifest_path, &st) == 0;
+        bool backed_gsb = false;
+        bool backed_manifest = false;
+        bool installed_gsb = false;
+        bool installed_manifest = false;
+        if (manifest_ok) {
+            unlink(gsb_backup);
+            unlink(manifest_backup);
+            if (had_gsb && rename(final_gsb, gsb_backup) != 0) manifest_ok = false;
+            else backed_gsb = had_gsb;
+            if (manifest_ok && had_manifest && rename(manifest_path, manifest_backup) != 0) manifest_ok = false;
+            else if (manifest_ok) backed_manifest = had_manifest;
+            if (manifest_ok && rename(download_path, final_gsb) != 0) manifest_ok = false;
+            else if (manifest_ok) installed_gsb = true;
+            if (manifest_ok && rename(manifest_tmp_path, manifest_path) != 0) manifest_ok = false;
+            else if (manifest_ok) installed_manifest = true;
+        }
+        if (!manifest_ok) {
+            unlink(manifest_tmp_path);
+            if (installed_manifest) unlink(manifest_path);
+            if (installed_gsb) unlink(final_gsb);
+            if (backed_manifest && rename(manifest_backup, manifest_path) != 0) {
+                ESP_LOGW(TAG, "manifest rollback failed for script %s", item->id);
+            }
+            if (backed_gsb && rename(gsb_backup, final_gsb) != 0) {
+                ESP_LOGW(TAG, "bytecode rollback failed for script %s", item->id);
+            }
+            ESP_LOGW(TAG, "script install failed for %s", item->id);
+            err = ESP_FAIL;
+        } else {
+            unlink(gsb_backup);
+            unlink(manifest_backup);
+            ESP_LOGI(TAG, "script installed: %s -> %s", item->id, final_gsb);
+            err = ESP_OK;
+        }
+    }
+    return err;
 }
 
 static esp_err_t install_item(const cloud_store_item_t *item) {
@@ -1138,92 +1319,7 @@ static esp_err_t install_item(const cloud_store_item_t *item) {
         err = plugin_installer_install_gapp(download_path);
         if (err == ESP_OK) plugin_manager_reload();
     } else if (item->type == CLOUD_STORE_TYPE_SCRIPT) {
-        char script_dir[128];
-        int n = snprintf(script_dir, sizeof(script_dir), "%s/%s", CLOUD_SCRIPTS_DIR, item->id);
-        if (n <= 0 || (size_t)n >= sizeof(script_dir)) {
-            err = ESP_ERR_INVALID_SIZE;
-            ESP_LOGW(TAG, "script dir path too long for %s", item->id);
-        } else {
-            mkdir_if_missing(script_dir);
-            char final_gsb[160];
-            snprintf(final_gsb, sizeof(final_gsb), "%s/%s.gsb", script_dir, item->id);
-            char entry_name[CLOUD_STORE_ID_MAX + 8];
-            snprintf(entry_name, sizeof(entry_name), "%s.gsb", item->id);
-            char manifest_path[160];
-            snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", script_dir);
-            char manifest_tmp_path[164];
-            snprintf(manifest_tmp_path, sizeof(manifest_tmp_path), "%s.tmp", manifest_path);
-            recover_script_install(final_gsb, manifest_path);
-            cJSON *manifest = cJSON_CreateObject();
-            cJSON *permissions = manifest ? cJSON_AddArrayToObject(manifest, "permissions") : NULL;
-            bool manifest_ok = manifest && permissions &&
-                               cJSON_AddStringToObject(manifest, "id", item->id) &&
-                               cJSON_AddStringToObject(manifest, "name", item->name) &&
-                               cJSON_AddStringToObject(manifest, "entry", entry_name) &&
-                               cJSON_AddNumberToObject(manifest, "memory_limit", item->script_memory_limit);
-            for (uint32_t bit = 0; manifest_ok && bit < 32; ++bit) {
-                uint32_t permission = 1u << bit;
-                if ((item->script_permissions & permission) == 0) continue;
-                const char *name = script_permission_name(permission);
-                if (!name || !cJSON_AddItemToArray(permissions, cJSON_CreateString(name))) {
-                    manifest_ok = false;
-                }
-            }
-            unlink(manifest_tmp_path);
-            char *manifest_json = manifest_ok ? cJSON_PrintUnformatted(manifest) : NULL;
-            FILE *mf = manifest_json ? fopen(manifest_tmp_path, "w") : NULL;
-            if (!mf) {
-                manifest_ok = false;
-            } else {
-                bool write_ok = fputs(manifest_json, mf) >= 0;
-                bool close_ok = fclose(mf) == 0;
-                manifest_ok = manifest_ok && write_ok && close_ok;
-            }
-            free(manifest_json);
-            cJSON_Delete(manifest);
-
-            char gsb_backup[164];
-            char manifest_backup[164];
-            snprintf(gsb_backup, sizeof(gsb_backup), "%s.bak", final_gsb);
-            snprintf(manifest_backup, sizeof(manifest_backup), "%s.bak", manifest_path);
-            struct stat st;
-            bool had_gsb = stat(final_gsb, &st) == 0;
-            bool had_manifest = stat(manifest_path, &st) == 0;
-            bool backed_gsb = false;
-            bool backed_manifest = false;
-            bool installed_gsb = false;
-            bool installed_manifest = false;
-            if (manifest_ok) {
-                unlink(gsb_backup);
-                unlink(manifest_backup);
-                if (had_gsb && rename(final_gsb, gsb_backup) != 0) manifest_ok = false;
-                else backed_gsb = had_gsb;
-                if (manifest_ok && had_manifest && rename(manifest_path, manifest_backup) != 0) manifest_ok = false;
-                else if (manifest_ok) backed_manifest = had_manifest;
-                if (manifest_ok && rename(download_path, final_gsb) != 0) manifest_ok = false;
-                else if (manifest_ok) installed_gsb = true;
-                if (manifest_ok && rename(manifest_tmp_path, manifest_path) != 0) manifest_ok = false;
-                else if (manifest_ok) installed_manifest = true;
-            }
-            if (!manifest_ok) {
-                unlink(manifest_tmp_path);
-                if (installed_manifest) unlink(manifest_path);
-                if (installed_gsb) unlink(final_gsb);
-                if (backed_manifest && rename(manifest_backup, manifest_path) != 0) {
-                    ESP_LOGW(TAG, "manifest rollback failed for script %s", item->id);
-                }
-                if (backed_gsb && rename(gsb_backup, final_gsb) != 0) {
-                    ESP_LOGW(TAG, "bytecode rollback failed for script %s", item->id);
-                }
-                ESP_LOGW(TAG, "script install failed for %s", item->id);
-                err = ESP_FAIL;
-            } else {
-                unlink(gsb_backup);
-                unlink(manifest_backup);
-                ESP_LOGI(TAG, "script installed: %s -> %s", item->id, final_gsb);
-                err = ESP_OK;
-            }
-        }
+        err = install_script_item(item, download_path);
     } else {
         char final_name[CLOUD_STORE_ID_MAX + 16];
         snprintf(final_name, sizeof(final_name), "%s.gtheme", item->id);
@@ -1252,10 +1348,38 @@ bool cloud_store_apps_available(void) {
     return heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
 }
 
+// Report how deep this task actually got. The stack budget above is only a
+// guess until something measures it: FreeRTOS lowers the high-water mark as a
+// task runs deeper, so reading it just before the task deletes itself gives the
+// deepest point of the whole fetch/download -- the mbedTLS handshake included.
+// On no-PSRAM boards the stack is charged to the same internal heap that
+// handshake needs, so this number is what decides how much of
+// CLOUD_TLS_TASK_STACK_BYTES can be handed back. Undershoots by the depth of
+// this log call itself, so leave a margin when trimming.
+static void log_stack_hwm(const char *label, uint32_t stack_bytes) {
+    UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "%s stack hwm: peak used %u of %u bytes (%u left)",
+             label,
+             (unsigned)(stack_bytes - free_bytes),
+             (unsigned)stack_bytes,
+             (unsigned)free_bytes);
+}
+
 static void refresh_task(void *arg) {
-    (void)arg;
+    bool caps_task = arg != NULL;
     cloud_store_pause_ap_if_needed();
-    esp_err_t err = refresh_manifest();
+    esp_err_t err = ESP_OK;
+#if defined(CONFIG_CROWPANEL_ADVANCED_P4)
+    // P4 can obtain its lease before SNTP has completed. Do not let the first
+    // Cloud Store request race the certificate validity check.
+    if (!wifi_manager_wait_for_valid_time(20000)) {
+        err = ESP_ERR_TIMEOUT;
+    } else {
+        err = refresh_manifest();
+    }
+#else
+    err = refresh_manifest();
+#endif
     xSemaphoreTake(s_ctx->mutex, portMAX_DELAY);
     s_ctx->status.state = err == ESP_OK ? CLOUD_STORE_STATE_READY : CLOUD_STORE_STATE_FAILED;
     strncpy(s_ctx->status.active_name, "Cloud Store", sizeof(s_ctx->status.active_name) - 1);
@@ -1270,7 +1394,12 @@ static void refresh_task(void *arg) {
     }
     s_ctx->task_running = false;
     xSemaphoreGive(s_ctx->mutex);
-    vTaskDelete(NULL);
+    log_stack_hwm("cloud_refresh", CLOUD_TLS_TASK_STACK_BYTES);
+    if (caps_task) {
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 esp_err_t cloud_store_refresh_async(void) {
@@ -1289,7 +1418,12 @@ esp_err_t cloud_store_refresh_async(void) {
     s_ctx->status.error[0] = '\0';
     xSemaphoreGive(s_ctx->mutex);
     cloud_store_pause_ap_if_needed();
-    BaseType_t rc = xTaskCreate_psram(refresh_task, "cloud_refresh", 8192, NULL, 5, NULL);
+    BaseType_t rc = xTaskCreateWithCaps(refresh_task, "cloud_refresh", CLOUD_TLS_TASK_STACK_BYTES,
+                                        (void *)1, 5, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (rc != pdPASS) {
+        // Same size from internal RAM -- no smaller retry, see CLOUD_TLS_TASK_STACK_BYTES.
+        rc = xTaskCreate(refresh_task, "cloud_refresh", CLOUD_TLS_TASK_STACK_BYTES, NULL, 5, NULL);
+    }
     if (rc != pdPASS) {
         xSemaphoreTake(s_ctx->mutex, portMAX_DELAY);
         s_ctx->task_running = false;
@@ -1372,7 +1506,12 @@ static void install_task(void *arg) {
     xSemaphoreTake(s_ctx->mutex, portMAX_DELAY);
     s_ctx->task_running = false;
     xSemaphoreGive(s_ctx->mutex);
-    vTaskDelete(NULL);
+    log_stack_hwm("cloud_install", CLOUD_INSTALL_TASK_STACK_BYTES);
+    if (req.caps_task) {
+        vTaskDeleteWithCaps(NULL);
+    } else {
+        vTaskDelete(NULL);
+    }
 }
 
 esp_err_t cloud_store_install_async(cloud_store_item_type_t type, const char *id) {
@@ -1395,14 +1534,22 @@ esp_err_t cloud_store_install_async(cloud_store_item_type_t type, const char *id
     xSemaphoreGive(s_ctx->mutex);
 
     cloud_store_pause_ap_if_needed();
-    BaseType_t rc = xTaskCreate_psram(install_task, "cloud_install", CLOUD_INSTALL_TASK_STACK_BYTES, req, 5, NULL);
-    if (rc != pdPASS && CLOUD_INSTALL_TASK_STACK_BYTES != CLOUD_INSTALL_TASK_FALLBACK_STACK_BYTES) {
-        ESP_LOGW(TAG, "install task stack allocation failed (%u bytes; free=%u largest=%u); retrying with %u bytes",
+    req->caps_task = true;
+    BaseType_t rc = xTaskCreateWithCaps(install_task, "cloud_install",
+                                        CLOUD_INSTALL_TASK_STACK_BYTES, req, 5, NULL,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (rc != pdPASS) {
+        // Retry at the same size out of internal RAM. Deliberately do not fall
+        // back to a smaller stack: anything under CLOUD_TLS_TASK_STACK_BYTES
+        // cannot survive the handshake on no-PSRAM boards, so a smaller retry
+        // would just trade a clean failure for a stack overflow reboot.
+        ESP_LOGW(TAG, "PSRAM install task stack allocation failed (%u bytes; free=%u largest=%u); retrying from internal RAM",
                  (unsigned)CLOUD_INSTALL_TASK_STACK_BYTES,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-                 (unsigned)CLOUD_INSTALL_TASK_FALLBACK_STACK_BYTES);
-        rc = xTaskCreate_psram(install_task, "cloud_install", CLOUD_INSTALL_TASK_FALLBACK_STACK_BYTES, req, 5, NULL);
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        req->caps_task = false;
+        rc = xTaskCreate(install_task, "cloud_install",
+                         CLOUD_INSTALL_TASK_STACK_BYTES, req, 5, NULL);
     }
     if (rc != pdPASS) {
         ESP_LOGE(TAG, "install task failed to start (free=%u largest=%u)",

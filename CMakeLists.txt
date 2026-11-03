@@ -10,10 +10,38 @@ endif()
 add_link_options("-Wl,-z,muldefs")
 add_compile_options(-Wno-error=unused-label)
 
-set(SDKCONFIG_DEFAULTS "sdkconfig.defaults")
+if(NOT DEFINED SDKCONFIG_DEFAULTS)
+    set(SDKCONFIG_DEFAULTS "sdkconfig.defaults")
+endif()
 # Disable ccache inside this project so builds do not depend on an external
 # launcher being present in the current shell environment.
 set(CCACHE_ENABLE 0 CACHE BOOL "Disable ccache for GhostESP" FORCE)
+# Keep the v2.2.2 ESP-IDF Wi-Fi Kconfig workaround while retaining the local
+# build configuration that explicitly disables ccache.
+if(DEFINED PYTHON)
+    set(GHOSTESP_PYTHON "${PYTHON}")
+else()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(GHOSTESP_PYTHON "${Python3_EXECUTABLE}")
+endif()
+if(IS_ABSOLUTE "${SDKCONFIG_DEFAULTS}")
+    set(GHOSTESP_SDKCONFIG_DEFAULTS "${SDKCONFIG_DEFAULTS}")
+else()
+    set(GHOSTESP_SDKCONFIG_DEFAULTS "${CMAKE_CURRENT_LIST_DIR}/${SDKCONFIG_DEFAULTS}")
+endif()
+execute_process(
+    COMMAND "${GHOSTESP_PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/scripts/prepare_idf_wifi_kconfig.py"
+            --idf-path "$ENV{IDF_PATH}" --config "${GHOSTESP_SDKCONFIG_DEFAULTS}"
+    RESULT_VARIABLE GHOSTESP_KCONFIG_RESULT
+    OUTPUT_VARIABLE GHOSTESP_KCONFIG_OUTPUT
+    ERROR_VARIABLE GHOSTESP_KCONFIG_ERROR
+)
+if(NOT GHOSTESP_KCONFIG_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to align ESP-IDF Wi-Fi Kconfig defaults:\n${GHOSTESP_KCONFIG_ERROR}")
+elseif(GHOSTESP_KCONFIG_OUTPUT)
+    string(STRIP "${GHOSTESP_KCONFIG_OUTPUT}" GHOSTESP_KCONFIG_OUTPUT)
+    message(STATUS "GhostESP: ${GHOSTESP_KCONFIG_OUTPUT}")
+endif()
 add_compile_definitions(HOLD_LIMIT=1000) # For joystick hold duration
 add_compile_definitions(LED_ORDER=0)     # 2 for RGB, 0 for GRB
 add_compile_definitions(DNS_SERVER_MAX_ITEMS=1)
@@ -82,4 +110,5 @@ add_compile_definitions(GHOSTESP_BUILD_NUMBER=${GHOSTESP_BUILD_NUMBER})
 # Include project settings
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(Ghost_ESP_IDF)
+include(cmake/crowpanel_rgb_factory.cmake)
 

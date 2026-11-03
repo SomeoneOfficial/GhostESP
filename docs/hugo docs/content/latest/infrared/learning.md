@@ -4,25 +4,25 @@ description: "Capture IR buttons and remotes with GhostESP"
 weight: 10
 ---
 
-## Before you start
+## Before You Start
 
 - **Hardware**: Board with IR RX support (see [hardware requirements]({{< relref "hardware.md" >}})).
 - **SD card**: Inserted and mounted so GhostESP can save `.ir` files under `/mnt/ghostesp/infrared/`.
 - **Easy Learn**: Optional assistant that suggests button names. Toggle via settings.
 
-## Learn a remote or button
+## Learn a Remote or Button
 
-1. Open **Infrared** and choose **Learn Remote** or **Learn Button** to append to an existing remote.
+1. Open **Infrared** and choose **Learn Remote** to learn a new remote. To add a button to an existing remote, open the remote file and choose **Add Signal**.
 
 2. Align the source remote with the IR receiver window, hold it steady within a few centimeters, then press the button once.
 
 3. Confirm the button name. Easy Learn provides a suggested label during learning, otherwise use the on-screen keyboard.
 
-4. Watch the preview popup for carrier frequency, protocol name, and decoded address/command details. If a known protocol decodes as RAW, cancel and retry.
+4. Watch the preview popup for protocol name and decoded address/command details. If a known protocol decodes as RAW, cancel and retry.
 
 5. Confirm to save. GhostESP will create a new `.ir` file for fresh remotes or append the button to the currently open file automatically.
 
-### Storage layout
+### Storage Layout
 
 - New remotes are written to `/mnt/ghostesp/infrared/remotes/<name>.ir`.
 - Adding to an existing remote appends another named button block inside the same `.ir` file.
@@ -30,11 +30,11 @@ weight: 10
 ### Tips
 
 - Keep the remote within a few centimeters of the receiver and avoid direct sunlight.
-- If learning fails, exit and re-open the Infrared learning popup to try to reinitialize the RMT RX channel.
+- If learning fails, exit and re-open the Infrared learning popup to try to reinitialize the IR RX channel (uses GPIO interrupts, not RMT).
 
 ## CLI Support
 
-You can learn signals via the command line using `ir learn`.
+You can learn signals via the CLI using `ir learn`.
 
 ```bash
 # Learn a signal and auto-save to a new file under /mnt/ghostesp/infrared/remotes
@@ -44,7 +44,7 @@ ir learn
 ir learn /mnt/ghostesp/infrared/remotes/my_remote.ir
 ```
 
-- Without a path, GhostESP generates a new `.ir` file name based on the decoded protocol/address/command (or a RAW timestamp) in `/mnt/ghostesp/infrared/remotes/`.
+- Without a path, GhostESP generates a new `.ir` file named `Learned_<protocol>_<address>_<command>.ir` (or `Learned_RAW_<timestamp>.ir` for RAW captures) in `/mnt/ghostesp/infrared/remotes/`.
 - With a path, the learned signal is appended to the given `.ir` file.
 
 ### Manual File Creation

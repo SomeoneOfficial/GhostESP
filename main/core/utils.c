@@ -1,4 +1,5 @@
 #include "core/utils.h"
+#include "managers/settings_manager.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <esp_heap_caps.h>
@@ -217,6 +218,101 @@ void format_mac_address(const uint8_t *mac, char *buffer, size_t buffer_len, boo
 }
 
 // ============================================================================
+// Privacy Mode (PII redaction for on-screen display)
+// ============================================================================
+
+bool privacy_mode_is_enabled(void) {
+  /* Reads the persisted flag straight out of the global settings struct, so
+   * there is no extra state, allocation or static buffer. */
+  return settings_get_privacy_mode(&G_Settings);
+}
+
+void privacy_redact_text(char *text) {
+  if (text == NULL || !privacy_mode_is_enabled()) {
+    return;
+  }
+  for (char *p = text; *p != '\0'; ++p) {
+    unsigned char c = (unsigned char)*p;
+    if (c >= 32 && c <= 126) {
+      *p = '*';
+    }
+  }
+}
+
+void privacy_redact_text_copy(const char *src, char *dst, size_t dst_size) {
+  if (dst == NULL || dst_size == 0) {
+    return;
+  }
+  if (src == NULL) {
+    dst[0] = '\0';
+    return;
+  }
+  strncpy(dst, src, dst_size - 1);
+  dst[dst_size - 1] = '\0';
+  privacy_redact_text(dst);
+}
+
+void privacy_redact_ssid(char *ssid) {
+  if (ssid == NULL || !privacy_mode_is_enabled()) {
+    return;
+  }
+  /* Placeholder labels contain no PII and stay readable. */
+  if (ssid[0] == '(' || ssid[0] == '<' || strncmp(ssid, "Hidden", 6) == 0) {
+    return;
+  }
+  privacy_redact_text(ssid);
+}
+
+void privacy_redact_ssid_copy(const char *src, char *dst, size_t dst_size) {
+  if (dst == NULL || dst_size == 0) {
+    return;
+  }
+  if (src == NULL) {
+    dst[0] = '\0';
+    return;
+  }
+  strncpy(dst, src, dst_size - 1);
+  dst[dst_size - 1] = '\0';
+  privacy_redact_ssid(dst);
+}
+
+void privacy_redact_mac(char *mac_text) {
+  static const char kLowerMask[] = "xx:xx:xx";
+  static const char kUpperMask[] = "XX:XX:XX";
+  if (mac_text == NULL || !privacy_mode_is_enabled()) {
+    return;
+  }
+  size_t len = strlen(mac_text);
+  bool upper = false;
+  if (len == 17) {
+    /* Full "AA:BB:CC:DD:EE:FF" -> keep the vendor OUI, mask the device half. */
+    for (int i = 0; i < 8; ++i) {
+      char c = mac_text[i];
+      if (c >= 'A' && c <= 'F') {
+        upper = true;
+        break;
+      }
+    }
+    memcpy(mac_text + 9, upper ? kUpperMask : kLowerMask, 8);
+  } else if (len == 8) {
+    /* Short "DD:EE:FF" device-id suffix (no vendor info) -> mask entirely. */
+    for (int i = 0; i < 8; ++i) {
+      char c = mac_text[i];
+      if (c >= 'A' && c <= 'F') {
+        upper = true;
+        break;
+      }
+    }
+    memcpy(mac_text, upper ? kUpperMask : kLowerMask, 8);
+  }
+}
+
+void format_mac_address_masked(const uint8_t *mac, char *buffer, size_t buffer_len, bool uppercase) {
+  format_mac_address(mac, buffer, buffer_len, uppercase);
+  privacy_redact_mac(buffer);
+}
+
+// ============================================================================
 // String Utilities
 // ============================================================================
 
@@ -364,6 +460,36 @@ const char *rssi_to_proximity(int8_t rssi) {
   return "Out of Range";
 }
 
+void rssi_median_reset(rssi_median_t *m) {
+  if (m) m->n = 0;
+}
+
+void rssi_median_push(rssi_median_t *m, int8_t rssi) {
+  if (!m) return;
+  if (m->n >= RSSI_MEDIAN_CAP) {
+    memmove(m->v, m->v + 1, RSSI_MEDIAN_CAP - 1);
+    m->n = RSSI_MEDIAN_CAP - 1;
+  }
+  m->v[m->n++] = rssi;
+}
+
+int8_t rssi_median_get(const rssi_median_t *m) {
+  if (!m || m->n == 0) return -100;
+  int8_t sorted[RSSI_MEDIAN_CAP];
+  memcpy(sorted, m->v, m->n);
+  for (uint8_t i = 1; i < m->n; i++) {
+    int8_t key = sorted[i];
+    uint8_t j = i;
+    while (j > 0 && sorted[j - 1] > key) {
+      sorted[j] = sorted[j - 1];
+      j--;
+    }
+    sorted[j] = key;
+  }
+  if (m->n & 1) return sorted[m->n / 2];
+  return (int8_t)((sorted[m->n / 2 - 1] + sorted[m->n / 2]) / 2);
+}
+
 // ============================================================================
 // Network Scanning Utilities
 // ============================================================================
@@ -396,6 +522,66 @@ bool get_wifi_subnet_prefix(char *prefix, size_t prefix_size) {
   }
   
   return false;
+}
+
+#define SUBNET_MAX_HOST_BITS 12
+
+bool get_wifi_subnet_range(char *prefix, size_t prefix_size,
+                           uint32_t *first_host, uint32_t *last_host) {
+  if (prefix == NULL || prefix_size < 16) {
+    return false;
+  }
+
+  esp_netif_t *netif = get_wifi_sta_netif();
+  if (!netif) {
+    return false;
+  }
+
+  esp_netif_ip_info_t ip_info;
+  if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK) {
+    return false;
+  }
+
+  uint32_t netmask = ntohl(ip_info.netmask.addr);
+  uint32_t my_ip = ntohl(ip_info.ip.addr);
+
+  int host_bits = 0;
+  uint32_t host_mask = ~netmask;
+  for (uint32_t bit = 1; bit && (host_mask & bit); bit <<= 1) {
+    host_bits++;
+  }
+
+  if (host_bits > SUBNET_MAX_HOST_BITS) {
+    host_bits = SUBNET_MAX_HOST_BITS;
+    host_mask = (1u << host_bits) - 1;
+  }
+
+  uint32_t network = my_ip & ~host_mask;
+  uint32_t broadcast = network | host_mask;
+  uint32_t first = network + 1;
+  uint32_t last = broadcast - 1;
+
+  if (first >= last) {
+    return false;
+  }
+
+  if (first_host) *first_host = first;
+  if (last_host) *last_host = last;
+
+  snprintf(prefix, prefix_size, "%u.%u.%u.%u",
+           (unsigned)((network >> 24) & 0xFF), (unsigned)((network >> 16) & 0xFF),
+           (unsigned)((network >> 8) & 0xFF), (unsigned)(network & 0xFF));
+  return true;
+}
+
+void ip_u32_to_str(uint32_t ip, char *out, size_t out_size) {
+  if (out == NULL || out_size < 16) {
+    if (out && out_size > 0) out[0] = '\0';
+    return;
+  }
+  snprintf(out, out_size, "%u.%u.%u.%u",
+           (unsigned)((ip >> 24) & 0xFF), (unsigned)((ip >> 16) & 0xFF),
+           (unsigned)((ip >> 8) & 0xFF), (unsigned)(ip & 0xFF));
 }
 
 int tcp_connect_with_timeout(const char *target_ip, uint16_t port, int timeout_sec) {
