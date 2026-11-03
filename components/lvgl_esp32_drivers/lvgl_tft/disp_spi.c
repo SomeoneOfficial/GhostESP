@@ -189,7 +189,10 @@ esp_err_t disp_spi_add_device_with_speed(spi_host_device_t host, int clock_speed
 static int disp_spi_get_mode(void)
 {
 #if defined(CONFIG_LV_TFT_DISPLAY_CONTROLLER_ST7789) && defined(CONFIG_BUILD_CONFIG_TEMPLATE)
-    if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "NM-CYD-C5") == 0) {
+    /* OrcaZero's ST7789 is wired for SPI mode 0.  Keep its board-specific
+     * timing override when incorporating the newer shared-SPI driver code. */
+    if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "NM-CYD-C5") == 0 ||
+        strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "OrcaZero") == 0) {
         return 0;
     }
 #endif
