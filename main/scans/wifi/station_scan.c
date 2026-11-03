@@ -309,9 +309,14 @@ static bool station_exists(const uint8_t *station_mac, const uint8_t *ap_bssid) 
  * scanned), so this is best effort and leaves the field as WIFI_AUTH_UNKNOWN
  * when the lookup fails.
  */
+/* ESP-IDF has no WIFI_AUTH_UNKNOWN enum value.  WIFI_AUTH_MAX is outside the
+ * valid auth-mode range and is therefore a stable sentinel for an AP that has
+ * not yet been found in the scan results. */
+#define STATION_AP_AUTHMODE_UNKNOWN WIFI_AUTH_MAX
+
 static void station_fill_ap_authmode(station_ap_pair_t *pair) {
     if (pair == NULL) return;
-    pair->ap_authmode = (uint8_t)WIFI_AUTH_UNKNOWN;
+    pair->ap_authmode = (uint8_t)STATION_AP_AUTHMODE_UNKNOWN;
 
     uint16_t ap_count = 0;
     wifi_ap_record_t *aps = NULL;
@@ -333,7 +338,7 @@ static void add_station_ap_pair(const uint8_t *station_mac, const uint8_t *ap_bs
         memcpy(station_ap_list[station_count].station_mac, station_mac, 6);
         memcpy(station_ap_list[station_count].ap_bssid, ap_bssid, 6);
         /* Resolved later, at selection time, when the AP scan is available. */
-        station_ap_list[station_count].ap_authmode = (uint8_t)WIFI_AUTH_UNKNOWN;
+        station_ap_list[station_count].ap_authmode = (uint8_t)STATION_AP_AUTHMODE_UNKNOWN;
         station_count++;
     } else {
         glog("Station list full\nCan't add more stations.\n");
